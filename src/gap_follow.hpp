@@ -28,6 +28,13 @@ class ReactiveGapFollow : public rclcpp::Node
     void expand_obstacles(std::vector<float> &ranges, std::vector<int> &obstacle_edges,
                           double vehicle_radius, double angle_increment);
     std::vector<float> filter_ranges(const std::vector<float>& ranges) const;
+    std::vector<float> predict_ranges_after_motion(
+        const std::vector<float>& ranges, float first_scan_angle, float angle_increment,
+        float range_max, float steering_angle, float travel_distance,
+        float& predicted_yaw) const;
+    float get_trajectory_collision_distance(
+        const std::vector<float>& ranges, float first_scan_angle, float angle_increment,
+        float range_max, float steering_angle) const;
     float get_safe_distance(const std::vector<float>& ranges, size_t center_index,
                               size_t check_width, float safety_level) const;
     size_t find_target_index(const std::vector<float>& ranges, float first_scan_angle,
@@ -38,7 +45,8 @@ class ReactiveGapFollow : public rclcpp::Node
     float set_speed_from_distance(float distance, float steering_angle);
     float get_speed_increase_ratio(float distance) const;
     float limit_speed_change(
-        float desired_speed, float distance, uint64_t current_time, float& acceleration);
+        float desired_speed, float distance, float collision_distance,
+        uint64_t current_time, float& acceleration);
     float smooth_steering(float new_value);
 
     std::deque<float> steering_window;
