@@ -432,7 +432,8 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
         0.0F,
         std::min(
             1.0F,
-            static_cast<float>(this->get_parameter("gap_width_preference").as_double())));
+            static_cast<float>(
+                this->get_parameter("gap_width_preference").as_double())));
     // Use the same angular neighbourhood for safe distance and gap width.
     const size_t gap_width_check_width = check_width;
 
@@ -584,7 +585,10 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     const auto clearance_for_angle = [&](float angle)
     {
         return this->get_safe_distance(
-            ranges, index_for_angle(angle), path_check_width, safety_level);
+            ranges,
+            index_for_angle(angle),
+            path_check_width,
+            safety_level);
     };
     const float maximum_steering_angle = std::max(
         0.0F,
@@ -608,6 +612,14 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     float opposite_target_score = 0.0F;
     float opposite_target_angle = 0.0F;
     bool limiting_ambiguous_gap = false;
+    const float ambiguous_gap_score_margin = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("ambiguous_gap_score_margin").as_double()));
+    const float ambiguous_gap_opposite_weight = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("ambiguous_gap_opposite_weight").as_double()));
     if (std::abs(target_angle) > path_check_angle)
     {
         const std::vector<float>& selection_ranges = using_narrow_gap
@@ -642,24 +654,29 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         limiting_ambiguous_gap
             = selected_target_distance > fallback_distance
             && opposite_target_distance > fallback_distance
-            && target_score <= opposite_target_score + fallback_distance;
+            && target_score
+                <= opposite_target_score + ambiguous_gap_score_margin;
         if (limiting_ambiguous_gap)
         {
             const float lateral_opening_angle = std::max(
                 path_check_angle,
                 maximum_steering_angle - path_check_angle);
             if (std::abs(opposite_target_angle) > std::abs(target_angle)
-                && std::abs(opposite_target_angle) >= lateral_opening_angle)
+                && std::abs(opposite_target_angle)
+                    >= lateral_opening_angle)
             {
                 // A newly visible branch at a larger bearing can be the real
                 // corner hidden behind an inner wall. Let it pull the command
                 // across early, before the currently deeper pocket wins enough
                 // lateral space to make that turn impossible.
-                const float combined_score = target_score + opposite_target_score;
+                const float weighted_opposite_score
+                    = opposite_target_score * ambiguous_gap_opposite_weight;
+                const float combined_score
+                    = target_score + weighted_opposite_score;
                 const float balanced_angle = combined_score
                         > std::numeric_limits<float>::epsilon()
                     ? (target_angle * target_score
-                        + opposite_target_angle * opposite_target_score)
+                        + opposite_target_angle * weighted_opposite_score)
                         / combined_score
                     : 0.0F;
                 target_angle = std::max(
@@ -850,7 +867,8 @@ float ReactiveGapFollow::limit_speed_change(
     // Decelerate hard toward a crawl speed instead of snapping to a full stop.
     // At speed 0 the Ackermann model cannot turn in place, so a hard stop next
     // to a wall would leave the car unable to steer itself back out.
-    if (collision_distance <= this->get_parameter("emergency_stop_distance").as_double())
+    if (collision_distance
+        <= this->get_parameter("emergency_stop_distance").as_double())
     {
         current_speed = std::max(
             minimum_crawl_speed, previous_speed - max_deceleration * elapsed_time);
