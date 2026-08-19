@@ -1,6 +1,7 @@
 #include "gap_follow.hpp"
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 int main(int argc, char** argv)
@@ -21,6 +22,8 @@ ReactiveGapFollow::ReactiveGapFollow():
         this->get_parameter("drive_topic").as_string(), qos);
     target_publisher = this->create_publisher<geometry_msgs::msg::PointStamped>(
         this->get_parameter("target_waypoint_topic").as_string(), qos);
+    marker_publisher = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        this->get_parameter("debug_marker_topic").as_string(), qos);
 
     scan_subscriber
         = this->create_subscription<sensor_msgs::msg::LaserScan>(
@@ -212,17 +215,27 @@ std::vector<float> ReactiveGapFollow::predict_ranges_after_motion(
         -maximum_steering, std::min(steering_angle, maximum_steering));
     const float curvature = std::tan(prediction_steering) / wheel_base;
 
-    float translation_x = travel_distance;
-    float translation_y = 0.0F;
+    float base_translation_x = travel_distance;
+    float base_translation_y = 0.0F;
     if (std::abs(curvature) > 1.0e-5F)
     {
         predicted_yaw = travel_distance * curvature;
-        translation_x = std::sin(predicted_yaw) / curvature;
-        translation_y = (1.0F - std::cos(predicted_yaw)) / curvature;
+        base_translation_x = std::sin(predicted_yaw) / curvature;
+        base_translation_y = (1.0F - std::cos(predicted_yaw)) / curvature;
     }
 
     const float cosine = std::cos(predicted_yaw);
     const float sine = std::sin(predicted_yaw);
+    const float lidar_offset_x = static_cast<float>(
+        this->get_parameter("lidar_offset_x").as_double());
+    const float lidar_offset_y = static_cast<float>(
+        this->get_parameter("lidar_offset_y").as_double());
+    const float translation_x
+        = base_translation_x + cosine * lidar_offset_x - sine * lidar_offset_y
+        - lidar_offset_x;
+    const float translation_y
+        = base_translation_y + sine * lidar_offset_x + cosine * lidar_offset_y
+        - lidar_offset_y;
     std::vector<float> predicted_ranges(ranges.size(), range_max);
 
     for (size_t i = 0; i < ranges.size(); ++i)
@@ -302,16 +315,20 @@ float ReactiveGapFollow::get_trajectory_collision_distance(
     const float checked_steering = std::max(
         -maximum_steering, std::min(steering_angle, maximum_steering));
     const float curvature = std::tan(checked_steering) / wheel_base;
+    const float lidar_offset_x = static_cast<float>(
+        this->get_parameter("lidar_offset_x").as_double());
+    const float lidar_offset_y = static_cast<float>(
+        this->get_parameter("lidar_offset_y").as_double());
 
     for (float travelled = 0.0F; travelled <= check_distance; travelled += check_step)
     {
-        float vehicle_x = travelled;
-        float vehicle_y = 0.0F;
+        float vehicle_x = travelled - lidar_offset_x;
+        float vehicle_y = -lidar_offset_y;
         if (std::abs(curvature) > 1.0e-5F)
         {
             const float yaw = travelled * curvature;
-            vehicle_x = std::sin(yaw) / curvature;
-            vehicle_y = (1.0F - std::cos(yaw)) / curvature;
+            vehicle_x = std::sin(yaw) / curvature - lidar_offset_x;
+            vehicle_y = (1.0F - std::cos(yaw)) / curvature - lidar_offset_y;
         }
 
         for (const auto& obstacle : obstacle_points)
@@ -327,6 +344,129 @@ float ReactiveGapFollow::get_trajectory_collision_distance(
     }
 
     return std::numeric_limits<float>::infinity();
+}
+
+void ReactiveGapFollow::publish_debug_markers(
+    const std_msgs::msg::Header& header,
+    float steering_angle,
+    float target_distance,
+    float collision_distance)
+{
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    visualization_msgs::msg::Marker target_marker;
+    target_marker.header = header;
+    target_marker.ns = "gap_follow";
+    target_marker.id = 0;
+    target_marker.type = visualization_msgs::msg::Marker::ARROW;
+    target_marker.action = visualization_msgs::msg::Marker::ADD;
+    target_marker.scale.x = 0.035;
+    target_marker.scale.y = 0.09;
+    target_marker.scale.z = 0.12;
+    target_marker.color.r = 0.1F;
+    target_marker.color.g = 0.6F;
+    target_marker.color.b = 1.0F;
+    target_marker.color.a = 1.0F;
+    geometry_msgs::msg::Point origin;
+    origin.z = 0.05;
+    geometry_msgs::msg::Point target;
+    target.x = target_distance * std::cos(steering_angle);
+    target.y = target_distance * std::sin(steering_angle);
+    target.z = 0.05;
+    target_marker.points.push_back(origin);
+    target_marker.points.push_back(target);
+    marker_array.markers.push_back(target_marker);
+
+    const float wheel_base = static_cast<float>(
+        this->get_parameter("wheel_base").as_double());
+    const float maximum_steering = static_cast<float>(
+        this->get_parameter("gap_prediction_max_steering_angle").as_double()
+        * M_PI / 180.0);
+    const float checked_steering = std::max(
+        -maximum_steering, std::min(steering_angle, maximum_steering));
+    const float curvature = wheel_base > std::numeric_limits<float>::epsilon()
+        ? std::tan(checked_steering) / wheel_base
+        : 0.0F;
+    const float check_distance = static_cast<float>(
+        this->get_parameter("trajectory_check_distance").as_double());
+    const float check_step = std::max(
+        0.01F,
+        static_cast<float>(this->get_parameter("trajectory_check_step").as_double()));
+    const float lidar_offset_x = static_cast<float>(
+        this->get_parameter("lidar_offset_x").as_double());
+    const float lidar_offset_y = static_cast<float>(
+        this->get_parameter("lidar_offset_y").as_double());
+    const float collision_radius = static_cast<float>(
+        this->get_parameter("vehicle_radius").as_double()
+        + this->get_parameter("trajectory_safety_margin").as_double());
+    const bool emergency = collision_distance
+        <= this->get_parameter("emergency_stop_distance").as_double();
+
+    visualization_msgs::msg::Marker trajectory_marker;
+    trajectory_marker.header = header;
+    trajectory_marker.ns = "gap_follow";
+    trajectory_marker.id = 1;
+    trajectory_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    trajectory_marker.action = visualization_msgs::msg::Marker::ADD;
+    trajectory_marker.scale.x = 0.04;
+    trajectory_marker.color.r = emergency ? 1.0F : 0.1F;
+    trajectory_marker.color.g = emergency ? 0.1F : 1.0F;
+    trajectory_marker.color.b = 0.1F;
+    trajectory_marker.color.a = 1.0F;
+
+    visualization_msgs::msg::Marker footprint_marker;
+    footprint_marker.header = header;
+    footprint_marker.ns = "gap_follow";
+    footprint_marker.id = 2;
+    footprint_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+    footprint_marker.action = visualization_msgs::msg::Marker::ADD;
+    footprint_marker.scale.x = collision_radius * 2.0F;
+    footprint_marker.scale.y = collision_radius * 2.0F;
+    footprint_marker.scale.z = 0.02;
+    footprint_marker.color.r = emergency ? 1.0F : 0.1F;
+    footprint_marker.color.g = emergency ? 0.1F : 0.8F;
+    footprint_marker.color.b = 0.1F;
+    footprint_marker.color.a = 0.08F;
+
+    for (float travelled = 0.0F; travelled <= check_distance; travelled += check_step)
+    {
+        geometry_msgs::msg::Point point;
+        point.x = travelled - lidar_offset_x;
+        point.y = -lidar_offset_y;
+        point.z = 0.03;
+        if (std::abs(curvature) > 1.0e-5F)
+        {
+            const float yaw = travelled * curvature;
+            point.x = std::sin(yaw) / curvature - lidar_offset_x;
+            point.y = (1.0F - std::cos(yaw)) / curvature - lidar_offset_y;
+        }
+        trajectory_marker.points.push_back(point);
+        footprint_marker.points.push_back(point);
+    }
+    marker_array.markers.push_back(trajectory_marker);
+    marker_array.markers.push_back(footprint_marker);
+
+    visualization_msgs::msg::Marker text_marker;
+    text_marker.header = header;
+    text_marker.ns = "gap_follow";
+    text_marker.id = 3;
+    text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    text_marker.action = visualization_msgs::msg::Marker::ADD;
+    text_marker.pose.position.x = 0.3;
+    text_marker.pose.position.y = 0.7;
+    text_marker.pose.position.z = 0.35;
+    text_marker.scale.z = 0.18;
+    text_marker.color.r = emergency ? 1.0F : 1.0F;
+    text_marker.color.g = emergency ? 0.2F : 1.0F;
+    text_marker.color.b = emergency ? 0.2F : 1.0F;
+    text_marker.color.a = 1.0F;
+    std::ostringstream status;
+    status << (emergency ? "STOP" : "CLEAR") << "  steer="
+           << steering_angle * 180.0F / static_cast<float>(M_PI) << " deg";
+    text_marker.text = status.str();
+    marker_array.markers.push_back(text_marker);
+
+    marker_publisher->publish(marker_array);
 }
 
 float ReactiveGapFollow::get_safe_distance(const std::vector<float>& ranges, size_t center_index,
@@ -346,7 +486,7 @@ float ReactiveGapFollow::get_safe_distance(const std::vector<float>& ranges, siz
 }
 
 size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, float first_scan_angle,
-                                             float angle_increment, size_t check_width,
+                                             float angle_increment, float range_max, size_t check_width,
                                              float safety_level,
                                              float& target_distance) const
 {
@@ -380,6 +520,15 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, fl
             (this->get_parameter("gap_width_check_angle").as_double() * M_PI / 180.0)
             / angle_increment));
 
+    // Normalize every score term to a comparable ~[0, 1] scale so center_preference
+    // and gap_width_preference behave as real relative weights. Without this, the
+    // raw meter-scale distance terms swamp the angle-based penalty and the car
+    // always chases whichever direction has the single longest sight line.
+    const float distance_scale = range_max > 1.0e-3F ? range_max : 1.0F;
+    const float angle_scale = std::max(
+        1.0e-3F,
+        static_cast<float>(this->get_parameter("max_scan_angle").as_double() * M_PI / 180.0));
+
     for (size_t i = search_begin; i <= search_end; ++i)
     {
         const float safe_distance = get_safe_distance(
@@ -403,9 +552,9 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, fl
 
         const float angle = first_scan_angle + static_cast<float>(i) * angle_increment;
         const float score
-            = (1.0F - gap_width_preference) * safe_distance
-            + gap_width_preference * width_score
-            - center_preference * std::abs(angle);
+            = (1.0F - gap_width_preference) * (safe_distance / distance_scale)
+            + gap_width_preference * (width_score / distance_scale)
+            - center_preference * (std::abs(angle) / angle_scale);
         if (score > best_score)
         {
             best_score = score;
@@ -488,6 +637,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         preferred_ranges,
         first_scan_angle,
         angle_increment,
+        scan_msg->range_max,
         path_check_width,
         safety_level,
         preferred_target_distance);
@@ -502,6 +652,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             ranges,
             first_scan_angle,
             angle_increment,
+            scan_msg->range_max,
             path_check_width,
             safety_level,
             ignored_distance);
@@ -539,6 +690,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             predicted_ranges,
             first_scan_angle,
             angle_increment,
+            scan_msg->range_max,
             path_check_width,
             safety_level,
             predicted_target_distance);
@@ -608,6 +760,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         desired_speed,
         safe_distance,
         collision_distance,
+        target_angle,
         static_cast<uint64_t>(command_time.nanoseconds()),
         acceleration);
     new_msg.drive.acceleration = acceleration;
@@ -621,6 +774,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         target_waypoint_msg.point.x = target_distance * std::cos(target_angle);
         target_waypoint_msg.point.y = target_distance * std::sin(target_angle);
         target_publisher->publish(target_waypoint_msg);
+        this->publish_debug_markers(
+            scan_msg->header, target_angle, target_distance, collision_distance);
     }
 };
 
@@ -658,6 +813,7 @@ float ReactiveGapFollow::limit_speed_change(
     float desired_speed,
     float distance,
     float collision_distance,
+    float steering_angle,
     uint64_t current_time,
     float& acceleration)
 {
@@ -669,29 +825,41 @@ float ReactiveGapFollow::limit_speed_change(
     last_update_time = current_time;
 
     const float previous_speed = current_speed;
+    const float minimum_crawl_speed = static_cast<float>(
+        this->get_parameter("minimum_crawl_speed").as_double());
+    const float max_deceleration = static_cast<float>(
+        this->get_parameter("max_deceleration").as_double());
 
-    // Stop only if the swept Ackermann path, including the vehicle footprint,
-    // actually intersects an obstacle within the emergency travel distance.
+    // Decelerate hard toward a crawl speed instead of snapping to a full stop.
+    // At speed 0 the Ackermann model cannot turn in place, so a hard stop next
+    // to a wall would leave the car unable to steer itself back out.
     if (collision_distance <= this->get_parameter("emergency_stop_distance").as_double())
     {
-        current_speed = 0.0F;
+        current_speed = std::max(
+            minimum_crawl_speed, previous_speed - max_deceleration * elapsed_time);
     }
     else if (desired_speed > previous_speed)
     {
         const float min_acceleration = this->get_parameter("min_acceleration").as_double();
+        // Taper the acceleration ceiling as the commanded steering angle grows,
+        // so the car does not keep sprinting straight into a turn it is about
+        // to have to take sharply.
+        const float steering_reference = static_cast<float>(
+            this->get_parameter("gap_prediction_max_steering_angle").as_double()
+            * M_PI / 180.0);
+        const float steering_ratio = steering_reference > 0.0F
+            ? std::max(0.0F, 1.0F - std::abs(steering_angle) / steering_reference)
+            : 1.0F;
         const float acceleration_limit = min_acceleration
             + (this->get_parameter("max_acceleration").as_double() - min_acceleration)
-            * get_speed_increase_ratio(distance);
+            * get_speed_increase_ratio(distance) * steering_ratio;
         current_speed = std::min(
             desired_speed, previous_speed + acceleration_limit * elapsed_time);
     }
     else
     {
         current_speed = std::max(
-            desired_speed,
-            previous_speed
-                - static_cast<float>(this->get_parameter("max_deceleration").as_double())
-                    * elapsed_time);
+            desired_speed, previous_speed - max_deceleration * elapsed_time);
     }
 
     acceleration = (current_speed - previous_speed) / elapsed_time;

@@ -6,6 +6,7 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "ackermann_msgs/msg/ackermann_drive_stamped.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -38,15 +39,18 @@ class ReactiveGapFollow : public rclcpp::Node
     float get_safe_distance(const std::vector<float>& ranges, size_t center_index,
                               size_t check_width, float safety_level) const;
     size_t find_target_index(const std::vector<float>& ranges, float first_scan_angle,
-                             float angle_increment, size_t check_width, float safety_level,
-                             float& target_distance) const;
+                             float angle_increment, float range_max, size_t check_width,
+                             float safety_level, float& target_distance) const;
     void lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
+    void publish_debug_markers(
+        const std_msgs::msg::Header& header, float steering_angle,
+        float target_distance, float collision_distance);
 
     float set_speed_from_distance(float distance, float steering_angle);
     float get_speed_increase_ratio(float distance) const;
     float limit_speed_change(
         float desired_speed, float distance, float collision_distance,
-        uint64_t current_time, float& acceleration);
+        float steering_angle, uint64_t current_time, float& acceleration);
     float smooth_steering(float new_value);
 
     std::deque<float> steering_window;
@@ -57,6 +61,7 @@ class ReactiveGapFollow : public rclcpp::Node
     rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_publisher;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr target_publisher;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher;
 };
 
 #endif  // GAP_FOLLOW_HPP

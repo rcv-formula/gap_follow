@@ -12,6 +12,7 @@ set(DEPENDENCY_LIST
   "geometry_msgs"
   "ackermann_msgs"
   "sensor_msgs"
+  "visualization_msgs"
   )
 
   set(MSGS

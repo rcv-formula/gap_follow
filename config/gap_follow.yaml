@@ -4,6 +4,9 @@ gap_follow:
       friction: 0.75
       wheel_base: 0.324
       vehicle_radius: 0.18
+      # base_link 기준 LiDAR 장착 위치 (0818 bag의 TF 기준)
+      lidar_offset_x: 0.27
+      lidar_offset_y: 0.0
 
       # 목표점 선택 여유
       gap_safety_margin: 0.05
@@ -25,7 +28,7 @@ gap_follow:
       default_qos: 1
 
       # 조향 경향성 유지 n개 평균 조향
-      steering_smooth_window: 1
+      steering_smooth_window: 3
 
       # LiDAR 거리값 중앙값 필터의 창 크기
       scan_filter_window: 5
@@ -58,7 +61,7 @@ gap_follow:
       # 가까운 구간에서 적용할 가속도
       min_acceleration: 0.5
       # 넓은 구간에서 적용할 최대 가속도
-      max_acceleration: 6.0
+      max_acceleration: 3.0
       # 속도를 줄일 때 적용할 최대 감속도
       max_deceleration: 6.0
 
@@ -81,6 +84,7 @@ gap_follow:
       lidar_scan_topic: /scan
       drive_topic: /drive
       target_waypoint_topic: /gap_follow/target_waypoint
+      debug_marker_topic: /gap_follow/debug_markers
       command_frame_id: base_link
 
       max_scan_angle: 90.0
