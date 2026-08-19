@@ -12,7 +12,6 @@ gap_follow:
       gap_safety_margin: 0.05
 
       # 안전 여유를 포함한 경로가 짧으면 실제 차량 반경으로 재탐색
-      # 목표 방향을 조향각으로 바꿀 때 사용하는 최소 lookahead이기도 함
       gap_fallback_distance: 0.8
 
       # 좁은 gap 통과 시 속도 범위
@@ -43,7 +42,6 @@ gap_follow:
       # 0이면 깊이 우선, 1이면 주변이 넓게 열린 방향 우선
       gap_width_preference: 0.8
       # 이 거리보다 깊은 공간에는 목표점 점수를 더 주지 않음
-      # 목표 방향을 조향각으로 바꿀 때 사용하는 최대 lookahead이기도 함
       gap_score_distance_cap: 3.0
 
       # 기록 차량의 실제 조향 범위에 맞춘 명령/충돌검사 공통 한계

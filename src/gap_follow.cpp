@@ -265,7 +265,6 @@ float ReactiveGapFollow::get_trajectory_collision_distance(
 
 void ReactiveGapFollow::publish_debug_markers(
     const std_msgs::msg::Header& header,
-    float target_bearing,
     float steering_angle,
     float target_distance,
     float collision_distance)
@@ -288,8 +287,8 @@ void ReactiveGapFollow::publish_debug_markers(
     geometry_msgs::msg::Point origin;
     origin.z = 0.05;
     geometry_msgs::msg::Point target;
-    target.x = target_distance * std::cos(target_bearing);
-    target.y = target_distance * std::sin(target_bearing);
+    target.x = target_distance * std::cos(steering_angle);
+    target.y = target_distance * std::sin(steering_angle);
     target.z = 0.05;
     target_marker.points.push_back(origin);
     target_marker.points.push_back(target);
@@ -379,9 +378,7 @@ void ReactiveGapFollow::publish_debug_markers(
     text_marker.color.b = emergency ? 0.2F : 1.0F;
     text_marker.color.a = 1.0F;
     std::ostringstream status;
-    status << (emergency ? "STOP" : "CLEAR") << "  target="
-           << target_bearing * 180.0F / static_cast<float>(M_PI)
-           << " deg  steer="
+    status << (emergency ? "STOP" : "CLEAR") << "  steer="
            << steering_angle * 180.0F / static_cast<float>(M_PI) << " deg";
     text_marker.text = status.str();
     marker_array.markers.push_back(text_marker);
@@ -408,9 +405,11 @@ float ReactiveGapFollow::get_safe_distance(const std::vector<float>& ranges, siz
 size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
                                              size_t check_width,
                                              float safety_level,
-                                             float& target_distance) const
+                                             float& target_distance,
+                                             float& target_score) const
 {
     target_distance = 0.0;
+    target_score = 0.0F;
     if (ranges.empty())
     {
         return 0;
@@ -478,35 +477,8 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
         }
     }
 
+    target_score = best_score;
     return best_index;
-}
-
-float ReactiveGapFollow::get_steering_for_target(
-    float target_bearing, float target_distance) const
-{
-    // The LiDAR bearing describes where the target is. It is not an Ackermann
-    // steering angle: convert the local target point to curvature first.
-    const float minimum_lookahead = std::max(
-        1.0e-3F,
-        static_cast<float>(this->get_parameter("gap_fallback_distance").as_double()));
-    const float maximum_lookahead = std::max(
-        minimum_lookahead,
-        static_cast<float>(this->get_parameter("gap_score_distance_cap").as_double()));
-    const float lookahead = std::max(
-        minimum_lookahead, std::min(target_distance, maximum_lookahead));
-    const float wheel_base = std::max(
-        0.0F,
-        static_cast<float>(this->get_parameter("wheel_base").as_double()));
-    const float steering_angle = std::atan2(
-        2.0F * wheel_base * std::sin(target_bearing), lookahead);
-    const float maximum_steering_angle = std::max(
-        0.0F,
-        static_cast<float>(
-            this->get_parameter("max_steering_angle").as_double()
-            * M_PI / 180.0));
-    return std::max(
-        -maximum_steering_angle,
-        std::min(steering_angle, maximum_steering_angle));
 }
 
 void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr scan_msg)
@@ -576,11 +548,13 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         path_check_angle / angle_increment));
     const float safety_level = this->get_parameter("safety_level").as_double();
     float preferred_target_distance = 0.0;
+    float target_score = 0.0F;
     size_t target_index = this->find_target_index(
         preferred_ranges,
         path_check_width,
         safety_level,
-        preferred_target_distance);
+        preferred_target_distance,
+        target_score);
 
     const float fallback_distance = static_cast<float>(
         this->get_parameter("gap_fallback_distance").as_double());
@@ -592,11 +566,11 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             ranges,
             path_check_width,
             safety_level,
-            selected_target_distance);
+            selected_target_distance,
+            target_score);
     }
 
-    float target_bearing
-        = first_scan_angle + static_cast<float>(target_index) * angle_increment;
+    float target_angle = first_scan_angle + static_cast<float>(target_index) * angle_increment;
     const auto index_for_angle = [&](float angle)
     {
         return static_cast<size_t>(std::max(
@@ -607,29 +581,108 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     (angle - first_scan_angle) / angle_increment)))));
     };
     const size_t forward_index = index_for_angle(0.0F);
+    const auto clearance_for_angle = [&](float angle)
+    {
+        return this->get_safe_distance(
+            ranges, index_for_angle(angle), path_check_width, safety_level);
+    };
     const float maximum_steering_angle = std::max(
         0.0F,
         static_cast<float>(
             this->get_parameter("max_steering_angle").as_double()
             * M_PI / 180.0));
-    const auto clamp_angle = [&](float angle)
+    const auto clamp_steering = [&](float angle)
     {
         return std::max(
             -maximum_steering_angle, std::min(angle, maximum_steering_angle));
     };
-    // Preserve the existing target search range, then convert its bearing to a
-    // physically meaningful Ackermann steering command.
-    target_bearing = clamp_angle(target_bearing);
-    selected_target_distance = this->get_safe_distance(
-        ranges, index_for_angle(target_bearing), path_check_width, safety_level);
-    float steering_angle = this->get_steering_for_target(
-        target_bearing, selected_target_distance);
+    // Use the same physical steering range for the command and collision check.
+    target_angle = clamp_steering(target_angle);
+
+    // At a fork-like opening, a dead-end pocket can be slightly deeper than the
+    // real track while both sides are still physically passable. Do not commit
+    // hard until one side has a meaningful score advantage. Keeping the command
+    // inside path_check_angle preserves enough room to take the other branch once
+    // its opening becomes visible.
+    float opposite_target_distance = 0.0F;
+    float opposite_target_score = 0.0F;
+    float opposite_target_angle = 0.0F;
+    bool limiting_ambiguous_gap = false;
+    if (std::abs(target_angle) > path_check_angle)
+    {
+        const std::vector<float>& selection_ranges = using_narrow_gap
+            ? ranges
+            : preferred_ranges;
+        std::vector<float> opposite_ranges = selection_ranges;
+        if (target_angle > 0.0F)
+        {
+            std::fill(
+                opposite_ranges.begin() + forward_index,
+                opposite_ranges.end(),
+                0.0F);
+        }
+        else
+        {
+            std::fill(
+                opposite_ranges.begin(),
+                opposite_ranges.begin() + forward_index + 1,
+                0.0F);
+        }
+
+        const size_t opposite_target_index = this->find_target_index(
+            opposite_ranges,
+            path_check_width,
+            safety_level,
+            opposite_target_distance,
+            opposite_target_score);
+        opposite_target_angle = clamp_steering(
+            first_scan_angle
+            + static_cast<float>(opposite_target_index) * angle_increment);
+
+        limiting_ambiguous_gap
+            = selected_target_distance > fallback_distance
+            && opposite_target_distance > fallback_distance
+            && target_score <= opposite_target_score + fallback_distance;
+        if (limiting_ambiguous_gap)
+        {
+            const float lateral_opening_angle = std::max(
+                path_check_angle,
+                maximum_steering_angle - path_check_angle);
+            if (std::abs(opposite_target_angle) > std::abs(target_angle)
+                && std::abs(opposite_target_angle) >= lateral_opening_angle)
+            {
+                // A newly visible branch at a larger bearing can be the real
+                // corner hidden behind an inner wall. Let it pull the command
+                // across early, before the currently deeper pocket wins enough
+                // lateral space to make that turn impossible.
+                const float combined_score = target_score + opposite_target_score;
+                const float balanced_angle = combined_score
+                        > std::numeric_limits<float>::epsilon()
+                    ? (target_angle * target_score
+                        + opposite_target_angle * opposite_target_score)
+                        / combined_score
+                    : 0.0F;
+                target_angle = std::max(
+                    -path_check_angle,
+                    std::min(balanced_angle, path_check_angle));
+            }
+            else
+            {
+                // In an ordinary corner the selected branch is already the more
+                // lateral one. Preserve its direction and only postpone the hard
+                // commitment until the other side stops being competitive.
+                target_angle = std::copysign(
+                    std::min(std::abs(target_angle), path_check_angle),
+                    target_angle);
+            }
+        }
+    }
 
     // A deep gap can still end in a corner. If the selected turn is physically
     // blocked within the current trajectory horizon, compare it with the best
     // gap on the opposite side and switch only when that path reaches farther.
     bool using_trajectory_fallback = false;
-    if (std::abs(target_bearing) > path_check_angle)
+    if (std::abs(target_angle) > path_check_angle)
     {
         const float selected_collision_distance
             = this->get_trajectory_collision_distance(
@@ -637,55 +690,20 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 first_scan_angle,
                 angle_increment,
                 scan_msg->range_max,
-                steering_angle);
+                target_angle);
         const float fallback_switch_distance = 0.5F * static_cast<float>(
             this->get_parameter("emergency_stop_distance").as_double()
             + this->get_parameter("trajectory_check_distance").as_double());
         if (std::isfinite(selected_collision_distance)
             && selected_collision_distance <= fallback_switch_distance)
         {
-            const std::vector<float>& selection_ranges = using_narrow_gap
-                ? ranges
-                : preferred_ranges;
-            std::vector<float> opposite_ranges = selection_ranges;
-            if (target_bearing > 0.0F)
-            {
-                std::fill(
-                    opposite_ranges.begin() + forward_index,
-                    opposite_ranges.end(),
-                    0.0F);
-            }
-            else
-            {
-                std::fill(
-                    opposite_ranges.begin(),
-                    opposite_ranges.begin() + forward_index + 1,
-                    0.0F);
-            }
-
-            float opposite_target_distance = 0.0F;
-            const size_t opposite_target_index = this->find_target_index(
-                opposite_ranges,
-                path_check_width,
-                safety_level,
-                opposite_target_distance);
-            const float opposite_target_bearing = clamp_angle(
-                first_scan_angle
-                + static_cast<float>(opposite_target_index) * angle_increment);
-            opposite_target_distance = this->get_safe_distance(
-                ranges,
-                index_for_angle(opposite_target_bearing),
-                path_check_width,
-                safety_level);
-            const float opposite_steering_angle = this->get_steering_for_target(
-                opposite_target_bearing, opposite_target_distance);
             const float opposite_collision_distance
                 = this->get_trajectory_collision_distance(
                     raw_ranges,
                     first_scan_angle,
                     angle_increment,
                     scan_msg->range_max,
-                    opposite_steering_angle);
+                    opposite_target_angle);
             const float minimum_improvement = static_cast<float>(
                 this->get_parameter("trajectory_check_step").as_double());
             if (opposite_target_distance > 0.0F
@@ -693,79 +711,55 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     || opposite_collision_distance
                         > selected_collision_distance + minimum_improvement))
             {
-                target_bearing = opposite_target_bearing;
-                selected_target_distance = opposite_target_distance;
-                steering_angle = opposite_steering_angle;
+                target_angle = opposite_target_angle;
                 using_trajectory_fallback = true;
             }
         }
     }
 
-    target_bearing = std::max(
+    target_angle = std::max(
         first_scan_angle,
         std::min(
             first_scan_angle + static_cast<float>(ranges.size() - 1) * angle_increment,
-            target_bearing));
-    if (using_trajectory_fallback)
+            target_angle));
+    if (using_trajectory_fallback || limiting_ambiguous_gap)
     {
-        // Do not let the old, blocked turn remain in the smoothing window and
-        // delay the emergency change to the alternative path.
+        // Do not let an old hard turn remain in the smoothing window and consume
+        // the maneuvering room that this decision is trying to preserve.
         steering_window.clear();
         steering_sum = 0.0F;
     }
-    const float unsmoothed_steering_angle = steering_angle;
-    const float smoothed_steering_angle = this->smooth_steering(steering_angle);
-    const float unsmoothed_collision_distance
-        = this->get_trajectory_collision_distance(
-            raw_ranges,
-            first_scan_angle,
-            angle_increment,
-            scan_msg->range_max,
-            unsmoothed_steering_angle);
-    const float smoothed_collision_distance
-        = this->get_trajectory_collision_distance(
-            raw_ranges,
-            first_scan_angle,
-            angle_increment,
-            scan_msg->range_max,
-            smoothed_steering_angle);
-    const float smoothing_clearance_tolerance = static_cast<float>(
-        this->get_parameter("trajectory_check_step").as_double());
-    // A smoothed steering command is accepted only if its predicted path is no
-    // less safe than the direct command. Bearing-based LiDAR clearance cannot
-    // be used here because steering and target bearing are now distinct.
-    steering_angle
-        = !std::isfinite(unsmoothed_collision_distance)
-              ? (!std::isfinite(smoothed_collision_distance)
-                     ? smoothed_steering_angle
-                     : unsmoothed_steering_angle)
-              : (!std::isfinite(smoothed_collision_distance)
-                     || smoothed_collision_distance + smoothing_clearance_tolerance
-                         >= unsmoothed_collision_distance
-                     ? smoothed_steering_angle
-                     : unsmoothed_steering_angle);
-    steering_angle = clamp_angle(steering_angle);
+    const float unsmoothed_target_angle = target_angle;
+    const float smoothed_target_angle = this->smooth_steering(target_angle);
+    const float smoothing_required_clearance = std::min(
+        clearance_for_angle(unsmoothed_target_angle), fallback_distance);
+    // Temporal smoothing is also an angular blend, so apply the same guard.
+    target_angle = clearance_for_angle(smoothed_target_angle)
+        >= smoothing_required_clearance
+        ? smoothed_target_angle
+        : unsmoothed_target_angle;
+    target_angle = clamp_steering(target_angle);
 
-    const size_t target_bearing_index = index_for_angle(target_bearing);
+    const size_t commanded_index = index_for_angle(target_angle);
 
     // Always use the physical-footprint scan for speed and emergency decisions.
     // The extra gap margin must influence preference, not create a false stop.
     const float target_distance = this->get_safe_distance(
-        ranges, target_bearing_index, path_check_width, safety_level);
+        ranges, commanded_index, path_check_width, safety_level);
     const float front_distance = this->get_safe_distance(
         ranges, forward_index, path_check_width, safety_level);
 
     // A close front wall is relevant while driving almost straight. In a corner,
     // use the selected gap direction so a wall in front does not force a false stop.
-    const float safe_distance = std::abs(steering_angle) <= path_check_angle
+    const float safe_distance = std::abs(target_angle) <= path_check_angle
         ? std::min(target_distance, front_distance)
         : target_distance;
 
     const auto command_time = this->now();
     new_msg.header.stamp = command_time;
     new_msg.header.frame_id = this->get_parameter("command_frame_id").as_string();
-    new_msg.drive.steering_angle = steering_angle;
-    float desired_speed = set_speed_from_distance(safe_distance, steering_angle);
+    new_msg.drive.steering_angle = target_angle;
+    float desired_speed = set_speed_from_distance(safe_distance, target_angle);
     if (using_narrow_gap)
     {
         desired_speed = std::min(
@@ -777,13 +771,13 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         first_scan_angle,
         angle_increment,
         scan_msg->range_max,
-        steering_angle);
+        target_angle);
     float acceleration = 0.0;
     new_msg.drive.speed = limit_speed_change(
         desired_speed,
         safe_distance,
         collision_distance,
-        steering_angle,
+        target_angle,
         static_cast<uint64_t>(command_time.nanoseconds()),
         acceleration);
     new_msg.drive.acceleration = acceleration;
@@ -794,15 +788,11 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     {
         geometry_msgs::msg::PointStamped target_waypoint_msg;
         target_waypoint_msg.header = scan_msg->header;
-        target_waypoint_msg.point.x = target_distance * std::cos(target_bearing);
-        target_waypoint_msg.point.y = target_distance * std::sin(target_bearing);
+        target_waypoint_msg.point.x = target_distance * std::cos(target_angle);
+        target_waypoint_msg.point.y = target_distance * std::sin(target_angle);
         target_publisher->publish(target_waypoint_msg);
         this->publish_debug_markers(
-            scan_msg->header,
-            target_bearing,
-            steering_angle,
-            target_distance,
-            collision_distance);
+            scan_msg->header, target_angle, target_distance, collision_distance);
     }
 };
 
