@@ -29,18 +29,14 @@ class ReactiveGapFollow : public rclcpp::Node
     void expand_obstacles(std::vector<float> &ranges, std::vector<int> &obstacle_edges,
                           double vehicle_radius, double angle_increment);
     std::vector<float> filter_ranges(const std::vector<float>& ranges) const;
-    std::vector<float> predict_ranges_after_motion(
-        const std::vector<float>& ranges, float first_scan_angle, float angle_increment,
-        float range_max, float steering_angle, float travel_distance,
-        float& predicted_yaw) const;
     float get_trajectory_collision_distance(
         const std::vector<float>& ranges, float first_scan_angle, float angle_increment,
         float range_max, float steering_angle) const;
     float get_safe_distance(const std::vector<float>& ranges, size_t center_index,
                               size_t check_width, float safety_level) const;
-    size_t find_target_index(const std::vector<float>& ranges, float first_scan_angle,
-                             float angle_increment, float range_max, size_t check_width,
-                             float safety_level, float& target_distance) const;
+    size_t find_target_index(const std::vector<float>& ranges, float angle_increment,
+                             size_t check_width, float safety_level,
+                             float& target_distance) const;
     void lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
     void publish_debug_markers(
         const std_msgs::msg::Header& header, float steering_angle,

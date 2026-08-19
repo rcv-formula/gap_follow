@@ -39,20 +39,15 @@ gap_follow:
       # 0이면 최소 거리, 1이면 최대 거리 선택
       safety_level: 0.2
 
-      # 값이 클수록 center 방향 우선
-      center_preference: 0.4
-
       # 0이면 깊이 우선, 1이면 주변이 넓게 열린 방향 우선
       gap_width_preference: 0.5
       # 후보 방향 좌우로 개방도를 평가할 각도
       gap_width_check_angle: 10.0
+      # 이 거리보다 깊은 공간에는 목표점 점수를 더 주지 않음
+      gap_score_distance_cap: 3.0
 
-      # 현재 조향으로 이동한 미래 차량 자세에서 gap을 다시 평가
-      gap_prediction_distance: 0.25
-      # 0이면 현재 gap만 사용, 1이면 예측 gap만 사용
-      gap_prediction_weight: 0.50
-      # 비현실적인 큰 조향각으로 예측 궤적이 발산하는 것을 제한
-      gap_prediction_max_steering_angle: 30.0
+      # 기록 차량의 실제 조향 범위에 맞춘 명령/충돌검사 공통 한계
+      max_steering_angle: 45.0
 
       speed_increase_start: 0.8
       speed_increase_end: 2.0
@@ -82,7 +77,7 @@ gap_follow:
      
 
       lidar_scan_topic: /scan
-      drive_topic: /drive
+      drive_topic: /drive_gf
       target_waypoint_topic: /gap_follow/target_waypoint
       debug_marker_topic: /gap_follow/debug_markers
       command_frame_id: base_link

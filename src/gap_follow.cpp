@@ -186,89 +186,6 @@ std::vector<float> ReactiveGapFollow::filter_ranges(const std::vector<float>& ra
     return filtered;
 }
 
-std::vector<float> ReactiveGapFollow::predict_ranges_after_motion(
-    const std::vector<float>& ranges,
-    float first_scan_angle,
-    float angle_increment,
-    float range_max,
-    float steering_angle,
-    float travel_distance,
-    float& predicted_yaw) const
-{
-    predicted_yaw = 0.0F;
-    if (ranges.empty() || travel_distance <= 0.0F || angle_increment <= 0.0F)
-    {
-        return ranges;
-    }
-
-    const float wheel_base = static_cast<float>(
-        this->get_parameter("wheel_base").as_double());
-    if (wheel_base <= std::numeric_limits<float>::epsilon())
-    {
-        return ranges;
-    }
-
-    const float maximum_steering = static_cast<float>(
-        this->get_parameter("gap_prediction_max_steering_angle").as_double()
-        * M_PI / 180.0);
-    const float prediction_steering = std::max(
-        -maximum_steering, std::min(steering_angle, maximum_steering));
-    const float curvature = std::tan(prediction_steering) / wheel_base;
-
-    float base_translation_x = travel_distance;
-    float base_translation_y = 0.0F;
-    if (std::abs(curvature) > 1.0e-5F)
-    {
-        predicted_yaw = travel_distance * curvature;
-        base_translation_x = std::sin(predicted_yaw) / curvature;
-        base_translation_y = (1.0F - std::cos(predicted_yaw)) / curvature;
-    }
-
-    const float cosine = std::cos(predicted_yaw);
-    const float sine = std::sin(predicted_yaw);
-    const float lidar_offset_x = static_cast<float>(
-        this->get_parameter("lidar_offset_x").as_double());
-    const float lidar_offset_y = static_cast<float>(
-        this->get_parameter("lidar_offset_y").as_double());
-    const float translation_x
-        = base_translation_x + cosine * lidar_offset_x - sine * lidar_offset_y
-        - lidar_offset_x;
-    const float translation_y
-        = base_translation_y + sine * lidar_offset_x + cosine * lidar_offset_y
-        - lidar_offset_y;
-    std::vector<float> predicted_ranges(ranges.size(), range_max);
-
-    for (size_t i = 0; i < ranges.size(); ++i)
-    {
-        const float range = ranges[i];
-        if (!std::isfinite(range) || range <= 0.0F || range >= range_max * 0.99F)
-        {
-            continue;
-        }
-
-        const float angle = first_scan_angle + static_cast<float>(i) * angle_increment;
-        const float shifted_x = range * std::cos(angle) - translation_x;
-        const float shifted_y = range * std::sin(angle) - translation_y;
-
-        // Rotate the static obstacle point into the predicted vehicle frame.
-        const float future_x = cosine * shifted_x + sine * shifted_y;
-        const float future_y = -sine * shifted_x + cosine * shifted_y;
-        const float future_angle = std::atan2(future_y, future_x);
-        const int future_index = static_cast<int>(std::round(
-            (future_angle - first_scan_angle) / angle_increment));
-        if (future_index < 0 || future_index >= static_cast<int>(ranges.size()))
-        {
-            continue;
-        }
-
-        const float future_range = std::hypot(future_x, future_y);
-        predicted_ranges[static_cast<size_t>(future_index)] = std::min(
-            predicted_ranges[static_cast<size_t>(future_index)], future_range);
-    }
-
-    return this->filter_ranges(predicted_ranges);
-}
-
 float ReactiveGapFollow::get_trajectory_collision_distance(
     const std::vector<float>& ranges,
     float first_scan_angle,
@@ -310,7 +227,7 @@ float ReactiveGapFollow::get_trajectory_collision_distance(
         return 0.0F;
     }
     const float maximum_steering = static_cast<float>(
-        this->get_parameter("gap_prediction_max_steering_angle").as_double()
+        this->get_parameter("max_steering_angle").as_double()
         * M_PI / 180.0);
     const float checked_steering = std::max(
         -maximum_steering, std::min(steering_angle, maximum_steering));
@@ -380,7 +297,7 @@ void ReactiveGapFollow::publish_debug_markers(
     const float wheel_base = static_cast<float>(
         this->get_parameter("wheel_base").as_double());
     const float maximum_steering = static_cast<float>(
-        this->get_parameter("gap_prediction_max_steering_angle").as_double()
+        this->get_parameter("max_steering_angle").as_double()
         * M_PI / 180.0);
     const float checked_steering = std::max(
         -maximum_steering, std::min(steering_angle, maximum_steering));
@@ -485,8 +402,8 @@ float ReactiveGapFollow::get_safe_distance(const std::vector<float>& ranges, siz
     return window[selected_index];
 }
 
-size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, float first_scan_angle,
-                                             float angle_increment, float range_max, size_t check_width,
+size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
+                                             float angle_increment, size_t check_width,
                                              float safety_level,
                                              float& target_distance) const
 {
@@ -509,7 +426,6 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, fl
 
     size_t best_index = search_begin;
     float best_score = -std::numeric_limits<float>::infinity();
-    const float center_preference = this->get_parameter("center_preference").as_double();
     const float gap_width_preference = std::max(
         0.0F,
         std::min(
@@ -520,15 +436,12 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, fl
             (this->get_parameter("gap_width_check_angle").as_double() * M_PI / 180.0)
             / angle_increment));
 
-    // Normalize every score term to a comparable ~[0, 1] scale so center_preference
-    // and gap_width_preference behave as real relative weights. Without this, the
-    // raw meter-scale distance terms swamp the angle-based penalty and the car
-    // always chases whichever direction has the single longest sight line.
-    const float distance_scale = range_max > 1.0e-3F ? range_max : 1.0F;
-    const float angle_scale = std::max(
+    // Preserve useful metre-scale differences inside the track, but do not let
+    // a very deep side opening keep gaining score.
+    const float distance_cap = std::max(
         1.0e-3F,
-        static_cast<float>(this->get_parameter("max_scan_angle").as_double() * M_PI / 180.0));
-
+        static_cast<float>(
+            this->get_parameter("gap_score_distance_cap").as_double()));
     for (size_t i = search_begin; i <= search_end; ++i)
     {
         const float safe_distance = get_safe_distance(
@@ -545,16 +458,17 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges, fl
         float range_sum = 0.0F;
         for (size_t j = width_begin; j <= width_end; ++j)
         {
-            range_sum += ranges[j];
+            // Cap each ray before averaging. Otherwise one max-range return can
+            // make a mostly narrow direction appear to be a wide open corridor.
+            range_sum += std::min(ranges[j], distance_cap);
         }
         const float width_score = range_sum
             / static_cast<float>(width_end - width_begin + 1);
+        const float capped_safe_distance = std::min(safe_distance, distance_cap);
 
-        const float angle = first_scan_angle + static_cast<float>(i) * angle_increment;
         const float score
-            = (1.0F - gap_width_preference) * (safe_distance / distance_scale)
-            + gap_width_preference * (width_score / distance_scale)
-            - center_preference * (std::abs(angle) / angle_scale);
+            = (1.0F - gap_width_preference) * capped_safe_distance
+            + gap_width_preference * width_score;
         if (score > best_score)
         {
             best_score = score;
@@ -635,9 +549,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     float preferred_target_distance = 0.0;
     size_t target_index = this->find_target_index(
         preferred_ranges,
-        first_scan_angle,
         angle_increment,
-        scan_msg->range_max,
         path_check_width,
         safety_level,
         preferred_target_distance);
@@ -650,73 +562,57 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         float ignored_distance = 0.0F;
         target_index = this->find_target_index(
             ranges,
-            first_scan_angle,
             angle_increment,
-            scan_msg->range_max,
             path_check_width,
             safety_level,
             ignored_distance);
     }
 
     float target_angle = first_scan_angle + static_cast<float>(target_index) * angle_increment;
-
-    // Re-evaluate the gap from a short predicted Ackermann pose. Bringing the
-    // future target back into the current frame accounts for how the visible gap
-    // shifts after the commanded turn without requiring a map or wall extraction.
-    const float prediction_distance = std::max(
-        0.0F,
-        static_cast<float>(this->get_parameter("gap_prediction_distance").as_double()));
-    const float prediction_weight = std::max(
-        0.0F,
-        std::min(
-            1.0F,
-            static_cast<float>(this->get_parameter("gap_prediction_weight").as_double())));
-    if (prediction_distance > 0.0F && prediction_weight > 0.0F)
+    const auto index_for_angle = [&](float angle)
     {
-        const std::vector<float>& prediction_source = using_narrow_gap
-            ? ranges
-            : preferred_ranges;
-        float predicted_yaw = 0.0F;
-        const std::vector<float> predicted_ranges = this->predict_ranges_after_motion(
-            prediction_source,
-            first_scan_angle,
-            angle_increment,
-            scan_msg->range_max,
-            target_angle,
-            prediction_distance,
-            predicted_yaw);
-        float predicted_target_distance = 0.0F;
-        const size_t predicted_target_index = this->find_target_index(
-            predicted_ranges,
-            first_scan_angle,
-            angle_increment,
-            scan_msg->range_max,
-            path_check_width,
-            safety_level,
-            predicted_target_distance);
-        const float predicted_target_angle
-            = first_scan_angle
-            + static_cast<float>(predicted_target_index) * angle_increment;
-        const float predicted_target_in_current_frame
-            = predicted_yaw + predicted_target_angle;
-        target_angle
-            = (1.0F - prediction_weight) * target_angle
-            + prediction_weight * predicted_target_in_current_frame;
-    }
+        return static_cast<size_t>(std::max(
+            0,
+            std::min(
+                static_cast<int>(ranges.size()) - 1,
+                static_cast<int>(std::round(
+                    (angle - first_scan_angle) / angle_increment)))));
+    };
+    const auto clearance_for_angle = [&](float angle)
+    {
+        return this->get_safe_distance(
+            ranges, index_for_angle(angle), path_check_width, safety_level);
+    };
+    const float maximum_steering_angle = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("max_steering_angle").as_double()
+            * M_PI / 180.0));
+    const auto clamp_steering = [&](float angle)
+    {
+        return std::max(
+            -maximum_steering_angle, std::min(angle, maximum_steering_angle));
+    };
+    // Use the same physical steering range for the command and collision check.
+    target_angle = clamp_steering(target_angle);
 
     target_angle = std::max(
         first_scan_angle,
         std::min(
             first_scan_angle + static_cast<float>(ranges.size() - 1) * angle_increment,
             target_angle));
-    target_angle = this->smooth_steering(target_angle);
+    const float unsmoothed_target_angle = target_angle;
+    const float smoothed_target_angle = this->smooth_steering(target_angle);
+    const float smoothing_required_clearance = std::min(
+        clearance_for_angle(unsmoothed_target_angle), fallback_distance);
+    // Temporal smoothing is also an angular blend, so apply the same guard.
+    target_angle = clearance_for_angle(smoothed_target_angle)
+        >= smoothing_required_clearance
+        ? smoothed_target_angle
+        : unsmoothed_target_angle;
+    target_angle = clamp_steering(target_angle);
 
-    const size_t commanded_index = static_cast<size_t>(std::max(
-        0,
-        std::min(
-            static_cast<int>(ranges.size()) - 1,
-            static_cast<int>(std::round(
-                (target_angle - first_scan_angle) / angle_increment)))));
+    const size_t commanded_index = index_for_angle(target_angle);
 
     // Always use the physical-footprint scan for speed and emergency decisions.
     // The extra gap margin must influence preference, not create a false stop.
@@ -845,7 +741,7 @@ float ReactiveGapFollow::limit_speed_change(
         // so the car does not keep sprinting straight into a turn it is about
         // to have to take sharply.
         const float steering_reference = static_cast<float>(
-            this->get_parameter("gap_prediction_max_steering_angle").as_double()
+            this->get_parameter("max_steering_angle").as_double()
             * M_PI / 180.0);
         const float steering_ratio = steering_reference > 0.0F
             ? std::max(0.0F, 1.0F - std::abs(steering_angle) / steering_reference)
