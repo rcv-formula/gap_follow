@@ -14,11 +14,11 @@ gap_follow:
 
       # 선택한 gap과 반대쪽 gap의 점수 차이가 이 값 이하면
       # 방향이 아직 애매하다고 보고 강조향을 잠시 제한
-      ambiguous_gap_score_margin: 1.5
+      ambiguous_gap_score_margin: 1.8
 
       # 애매한 상황에서 더 바깥쪽에 발견된 반대 gap의 영향력
       # 1.0은 동일 비중, 클수록 반대 방향을 더 일찍 반영
-      ambiguous_gap_opposite_weight: 1.5
+      ambiguous_gap_opposite_weight: 2.0
 
       # ============================================================
       # 조향 및 속도 튜닝
@@ -39,12 +39,12 @@ gap_follow:
 
       # 안전거리가 start에서 end로 증가할 때 속도 배율을
       # 1.0에서 speed_increase_factor까지 증가
-      speed_increase_start: 5.0
+      speed_increase_start: 3.0
       speed_increase_end: 15.0
-      speed_increase_factor: 1.2
+      speed_increase_factor: 1.5
 
       min_acceleration: 0.5
-      max_acceleration: 3.0
+      max_acceleration: 4.0
       max_deceleration: 6.0
 
       # ============================================================
@@ -66,14 +66,14 @@ gap_follow:
       # 안전 여유를 적용한 gap이 이 거리보다 짧으면
       # vehicle_radius만 적용한 좁은 gap으로 다시 탐색
       # 좌우 gap 모두 주행 가능한지 판단하는 최소 거리로도 사용
-      gap_fallback_distance: 0.8
+      gap_fallback_distance: 0.5
 
       # 목표 방향 주변 ±각도에서 안전거리를 검사
       # 방향이 애매할 때 조향을 제한하는 각도로도 사용
-      path_check_angle: 10.0
+      path_check_angle: 30.0
 
       # 0: 주변 최소 거리 / 1: 주변 최대 거리를 안전거리로 사용
-      safety_level: 0.2
+      safety_level: 0.5
 
       # ============================================================
       # LiDAR 전처리
@@ -91,9 +91,9 @@ gap_follow:
       # ============================================================
 
       # 이 거리 안에서 충돌이 예상되면 minimum_crawl_speed까지 감속
-      emergency_stop_distance: 0.3
+      emergency_stop_distance: 0.4
       # 충돌 여부를 검사할 진행 거리와 계산 간격
-      trajectory_check_distance: 0.7
+      trajectory_check_distance: 1.0
       trajectory_check_step: 0.05
       # 충돌검사 시 vehicle_radius에 추가할 안전 여유
       trajectory_safety_margin: 0.05
