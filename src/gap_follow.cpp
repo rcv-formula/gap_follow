@@ -403,7 +403,7 @@ float ReactiveGapFollow::get_safe_distance(const std::vector<float>& ranges, siz
 }
 
 size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
-                                             float angle_increment, size_t check_width,
+                                             size_t check_width,
                                              float safety_level,
                                              float& target_distance) const
 {
@@ -431,10 +431,8 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
         std::min(
             1.0F,
             static_cast<float>(this->get_parameter("gap_width_preference").as_double())));
-    const size_t gap_width_check_width = static_cast<size_t>(
-        std::ceil(
-            (this->get_parameter("gap_width_check_angle").as_double() * M_PI / 180.0)
-            / angle_increment));
+    // Use the same angular neighbourhood for safe distance and gap width.
+    const size_t gap_width_check_width = check_width;
 
     // Preserve useful metre-scale differences inside the track, but do not let
     // a very deep side opening keep gaining score.
@@ -541,15 +539,14 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
 
     ackermann_msgs::msg::AckermannDriveStamped new_msg;
 
-    const size_t path_check_width = static_cast<size_t>(
-        std::ceil(
-            (this->get_parameter("path_check_angle").as_double() * M_PI / 180.0)
-            / angle_increment));
+    const float path_check_angle = static_cast<float>(
+        this->get_parameter("path_check_angle").as_double() * M_PI / 180.0);
+    const size_t path_check_width = static_cast<size_t>(std::ceil(
+        path_check_angle / angle_increment));
     const float safety_level = this->get_parameter("safety_level").as_double();
     float preferred_target_distance = 0.0;
     size_t target_index = this->find_target_index(
         preferred_ranges,
-        angle_increment,
         path_check_width,
         safety_level,
         preferred_target_distance);
@@ -562,7 +559,6 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         float ignored_distance = 0.0F;
         target_index = this->find_target_index(
             ranges,
-            angle_increment,
             path_check_width,
             safety_level,
             ignored_distance);
@@ -578,6 +574,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 static_cast<int>(std::round(
                     (angle - first_scan_angle) / angle_increment)))));
     };
+    const size_t forward_index = index_for_angle(0.0F);
     const auto clearance_for_angle = [&](float angle)
     {
         return this->get_safe_distance(
@@ -596,11 +593,85 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     // Use the same physical steering range for the command and collision check.
     target_angle = clamp_steering(target_angle);
 
+    // A deep gap can still end in a corner. If the selected turn is physically
+    // blocked within the current trajectory horizon, compare it with the best
+    // gap on the opposite side and switch only when that path reaches farther.
+    bool using_trajectory_fallback = false;
+    if (std::abs(target_angle) > path_check_angle)
+    {
+        const float selected_collision_distance
+            = this->get_trajectory_collision_distance(
+                raw_ranges,
+                first_scan_angle,
+                angle_increment,
+                scan_msg->range_max,
+                target_angle);
+        const float fallback_switch_distance = 0.5F * static_cast<float>(
+            this->get_parameter("emergency_stop_distance").as_double()
+            + this->get_parameter("trajectory_check_distance").as_double());
+        if (std::isfinite(selected_collision_distance)
+            && selected_collision_distance <= fallback_switch_distance)
+        {
+            const std::vector<float>& selection_ranges = using_narrow_gap
+                ? ranges
+                : preferred_ranges;
+            std::vector<float> opposite_ranges = selection_ranges;
+            if (target_angle > 0.0F)
+            {
+                std::fill(
+                    opposite_ranges.begin() + forward_index,
+                    opposite_ranges.end(),
+                    0.0F);
+            }
+            else
+            {
+                std::fill(
+                    opposite_ranges.begin(),
+                    opposite_ranges.begin() + forward_index + 1,
+                    0.0F);
+            }
+
+            float opposite_target_distance = 0.0F;
+            const size_t opposite_target_index = this->find_target_index(
+                opposite_ranges,
+                path_check_width,
+                safety_level,
+                opposite_target_distance);
+            const float opposite_target_angle = clamp_steering(
+                first_scan_angle
+                + static_cast<float>(opposite_target_index) * angle_increment);
+            const float opposite_collision_distance
+                = this->get_trajectory_collision_distance(
+                    raw_ranges,
+                    first_scan_angle,
+                    angle_increment,
+                    scan_msg->range_max,
+                    opposite_target_angle);
+            const float minimum_improvement = static_cast<float>(
+                this->get_parameter("trajectory_check_step").as_double());
+            if (opposite_target_distance > 0.0F
+                && (!std::isfinite(opposite_collision_distance)
+                    || opposite_collision_distance
+                        > selected_collision_distance + minimum_improvement))
+            {
+                target_angle = opposite_target_angle;
+                using_trajectory_fallback = true;
+            }
+        }
+    }
+
     target_angle = std::max(
         first_scan_angle,
         std::min(
             first_scan_angle + static_cast<float>(ranges.size() - 1) * angle_increment,
             target_angle));
+    if (using_trajectory_fallback)
+    {
+        // Do not let the old, blocked turn remain in the smoothing window and
+        // delay the emergency change to the alternative path.
+        steering_window.clear();
+        steering_sum = 0.0F;
+    }
     const float unsmoothed_target_angle = target_angle;
     const float smoothed_target_angle = this->smooth_steering(target_angle);
     const float smoothing_required_clearance = std::min(
@@ -618,19 +689,12 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     // The extra gap margin must influence preference, not create a false stop.
     const float target_distance = this->get_safe_distance(
         ranges, commanded_index, path_check_width, safety_level);
-    const int forward_index = std::max(
-        0,
-        std::min(
-            static_cast<int>(ranges.size()) - 1,
-            static_cast<int>(std::round(-first_scan_angle / angle_increment))));
     const float front_distance = this->get_safe_distance(
-        ranges, static_cast<size_t>(forward_index), path_check_width, safety_level);
+        ranges, forward_index, path_check_width, safety_level);
 
     // A close front wall is relevant while driving almost straight. In a corner,
     // use the selected gap direction so a wall in front does not force a false stop.
-    const float front_check_angle = static_cast<float>(
-        this->get_parameter("front_safety_check_angle").as_double() * M_PI / 180.0);
-    const float safe_distance = std::abs(target_angle) <= front_check_angle
+    const float safe_distance = std::abs(target_angle) <= path_check_angle
         ? std::min(target_distance, front_distance)
         : target_distance;
 

@@ -34,8 +34,8 @@ class ReactiveGapFollow : public rclcpp::Node
         float range_max, float steering_angle) const;
     float get_safe_distance(const std::vector<float>& ranges, size_t center_index,
                               size_t check_width, float safety_level) const;
-    size_t find_target_index(const std::vector<float>& ranges, float angle_increment,
-                             size_t check_width, float safety_level,
+    size_t find_target_index(const std::vector<float>& ranges, size_t check_width,
+                             float safety_level,
                              float& target_distance) const;
     void lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
     void publish_debug_markers(

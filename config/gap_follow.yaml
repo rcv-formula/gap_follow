@@ -40,9 +40,7 @@ gap_follow:
       safety_level: 0.2
 
       # 0이면 깊이 우선, 1이면 주변이 넓게 열린 방향 우선
-      gap_width_preference: 0.5
-      # 후보 방향 좌우로 개방도를 평가할 각도
-      gap_width_check_angle: 10.0
+      gap_width_preference: 0.8
       # 이 거리보다 깊은 공간에는 목표점 점수를 더 주지 않음
       gap_score_distance_cap: 3.0
 
@@ -67,9 +65,6 @@ gap_follow:
       trajectory_check_step: 0.05
       # 차체 반경에 추가하는 궤적 충돌 검사 여유
       trajectory_safety_margin: 0.05
-
-      # 작은 조향각에서만 정면 거리를 비상정지 판단에 포함
-      front_safety_check_angle: 10.0
 
       initial_update_time: 0.05
 
