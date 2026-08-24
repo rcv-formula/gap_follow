@@ -46,6 +46,7 @@ flowchart LR
 각 LiDAR 후보 방향 주변 `±path_check_angle`에서 두 값을 계산합니다.
 
 - `safe_distance`: 주변 거리값을 정렬한 뒤 `safety_level` 위치에서 선택한 거리
+- `guard_clearance`: 같은 주변 거리에서 `candidate_safety_level` 위치를 선택한 후보 통과 기준
 - `width_score`: 주변 거리값을 `gap_score_distance_cap`으로 제한한 뒤 계산한 평균
 
 최종 점수는 다음과 같습니다.
@@ -66,7 +67,7 @@ score = (1 - gap_width_preference) * capped_safe_distance
 | `0.5` | 중앙값 |
 | `1.0` | 최대 거리, 가장 공격적 |
 
-`safety_level`은 반드시 `0.0`부터 `1.0` 사이로 설정해야 합니다.
+`safety_level`과 `candidate_safety_level`은 반드시 `0.0`부터 `1.0` 사이로 설정해야 합니다. 높은 `safety_level`은 기존 gap 점수와 속도 특성을 유지하고, 더 낮은 `candidate_safety_level`은 좁은 정적 장애물이 주변의 긴 ray에 묻혀 안전 후보로 잘못 통과하는 것을 막습니다.
 
 ### 3. 좌우 분기 판단
 
@@ -85,8 +86,7 @@ score = (1 - gap_width_preference) * capped_safe_distance
 
 path 가산점은 다음 LiDAR 안전조건을 모두 만족한 후보에만 적용됩니다.
 
-- 후보 안전거리가 `path_candidate_min_clearance` 이상
-- LiDAR-only 최적 gap 안전거리의 `path_candidate_min_clearance_ratio` 이상
+- 후보 `guard_clearance`가 공통 `candidate_min_clearance` 이상
 - LiDAR-only 최적 gap 점수의 `path_candidate_min_score_ratio` 이상
 
 따라서 path 앞이 막히고 반대쪽만 안전하면 기존 gap follower처럼 반대쪽으로 회피합니다. 좌우가 모두 위 조건을 만족할 때만 path와 가까운 방향이 선택됩니다. 경로에서 `path_rejoin_distance`보다 멀어지면 `path_rejoin_weight`가 적용되어 안전 후보 사이에서 복귀 방향 preference가 강해집니다.
@@ -95,19 +95,21 @@ path 가산점은 다음 LiDAR 안전조건을 모두 만족한 후보에만 적
 
 ### 5. 조향 궤적 충돌검사
 
-현재 조향 명령을 Ackermann 원호로 변환하고, 원호 위를 `trajectory_check_step` 간격으로 `trajectory_check_distance`까지 검사합니다. 차량 중심과 LiDAR 포인트의 거리가 다음 반경보다 작아지면 충돌로 판단합니다.
+최신 `/ackermann_cmd` 조향에서 새 목표 조향까지 `steering_transition_time` 동안 점진적으로 변하는 Ackermann 궤적을 `trajectory_check_step` 간격으로 검사합니다. 조향 피드백이 오래됐으면 직전 gap follower 명령을 시작 조향으로 사용합니다. 차량 중심과 LiDAR 포인트의 거리가 다음 반경보다 작아지면 충돌로 판단합니다.
 
 ```text
 collision_radius = vehicle_radius + trajectory_safety_margin
 ```
 
-선택한 강조향 경로가 가까운 거리에서 막히면 crawl 감속 전에 전체 조향 범위를 다시 검사합니다. `avoidance_min_clearance` 이상의 gap이면서 `avoidance_collision_free_distance`까지 충돌이 없는 대체 조향이 발견되면 해당 방향으로 회피하고 기존 거리 기반 속도를 유지합니다. 모든 조향 궤적이 막혔을 때만 `minimum_crawl_speed`로 감속합니다.
+선택한 궤적이 `/odom` 속도에서 계산한 제동거리 안에서 막히면 crawl 감속 전에 전체 조향 범위를 다시 검사합니다. `candidate_safety_level`로 계산한 `guard_clearance`가 공통 `candidate_min_clearance` 이상이고 제동거리까지 충돌이 없는 대체 조향이 발견되면 해당 방향으로 회피하고 기존 속도를 유지합니다. 모든 조향 궤적이 막혔을 때만 TTC로 속도 상한을 계산합니다.
+
+장애물을 피해 한쪽 조향을 선택하면 `avoidance_direction_hold_time` 동안 같은 방향을 유지합니다. 이후 정면 안전거리가 `2 × candidate_min_clearance` 이상인 상태가 `0.5 × avoidance_direction_hold_time` 동안 이어지면 고정을 해제합니다. 단, 고정된 쪽에서 안전한 궤적을 찾지 못하면 즉시 반대쪽 회피 또는 crawl을 허용합니다.
 
 ### 6. 속도 제어
 
 기본 목표 속도는 안전거리에 `speed_factor`를 곱해 계산하며, 먼 공간에서는 `speed_increase_factor`만큼 점진적으로 증가합니다. 조향이 클 때는 마찰계수와 wheelbase로 계산한 선회 속도 한계를 적용합니다.
 
-`emergency_stop_distance` 안에서 충돌이 예상되더라도 속도를 0으로 만들지 않습니다. `max_deceleration`으로 감속하면서 최소 `minimum_crawl_speed`를 유지합니다. 파라미터 이름에는 `stop`이 포함되어 있지만 현재 동작은 완전 정지가 아니라 저속 주행입니다.
+제동거리는 `steering_transition_time`, `/odom` 속도, `max_deceleration`, `trajectory_safety_margin`으로 계산합니다. 전환 궤적이 안전한 조향이 하나라도 있으면 감속하지 않습니다. 모든 조향이 위험할 때만 충돌거리에서 주행 가능한 속도를 역산하며, TTC가 `steering_transition_time`보다 짧을 때만 `minimum_crawl_speed`를 향해 감속합니다.
 
 ## ROS 인터페이스
 
@@ -194,18 +196,16 @@ RViz에는 다음 display를 추가합니다.
 |---|---:|---|
 | `enable_path_guidance` | `true` | global path와 localization이 유효할 때 path 조향 preference 활성화 |
 | `localization_topic` | `/odom` | `Odometry` localization 토픽 |
-| `localization_timeout` | `0.5` s | 이 시간보다 오래된 pose는 사용하지 않음 |
+| `odom_timeout` | `0.3` s | path pose와 TTC 속도에 공통 적용하는 odom 유효시간 |
 | `global_path_topic` | `/global_path` | `nav_msgs/msg/Path` 입력 토픽 |
 | `global_path_transient_local` | `true` | latched path 수신용 transient-local QoS |
 | `path_is_closed` | `true` | 폐곡선 트랙 여부 |
 | `path_lookahead_distance` | `1.2` m | path 진행방향의 조향 목표 거리 |
-| `path_guidance_weight` | `1.0` | 평상시 안전 gap 사이의 path preference |
-| `path_rejoin_weight` | `2.5` | path 이탈 시 안전 gap 사이의 복귀 preference |
+| `path_guidance_weight` | `0.6` | 평상시 안전 gap 사이의 path preference |
+| `path_rejoin_weight` | `1.0` | path 이탈 시 안전 gap 사이의 복귀 preference |
 | `path_rejoin_distance` | `0.5` m | 복귀 preference 적용 시작 거리 |
-| `path_candidate_min_clearance` | `1.0` m | path 가산점을 허용할 절대 최소 안전거리 |
 | `path_candidate_min_score_ratio` | `0.85` | LiDAR-only 최적 gap 대비 최소 기본점수 비율 |
-| `path_candidate_min_clearance_ratio` | `0.8` | LiDAR-only 최적 gap 대비 최소 안전거리 비율 |
-| `path_alignment_sigma` | `25.0` deg | path 방향 preference의 각도 폭 |
+| `path_alignment_sigma` | `35.0` deg | path 방향 preference의 각도 폭 |
 | `path_max_guidance_angle` | `85.0` deg | 이보다 뒤쪽인 path 목표는 무시 |
 | `path_heading_search_weight` | `0.5` | 교차 경로에서 진행방향이 같은 segment 선호도 |
 
@@ -215,11 +215,11 @@ RViz에는 다음 display를 추가합니다.
 |---|---:|---|
 | `max_steering_angle` | `45.0` deg | 명령 및 충돌검사에 사용하는 최대 조향각 |
 | `steering_smooth_window` | `3` | 최근 조향 명령 평균 개수 |
-| `speed_factor` | `0.4` | 안전거리에서 기본 속도로 변환하는 계수 |
-| `max_speed` | `4.0` m/s | 최대 속도 |
+| `speed_factor` | `0.24` | 안전거리에서 기본 속도로 변환하는 계수 |
+| `max_speed` | `3.0` m/s | 최대 속도 |
 | `narrow_gap_max_speed` | `1.5` m/s | 기본 차량 반경만으로 재탐색한 좁은 gap의 속도 제한 |
-| `minimum_non_emergency_speed` | `1.1` m/s | 비상 충돌 궤적이 아닐 때 유지하는 일반 최저 속도 |
-| `minimum_crawl_speed` | `0.8` m/s | 실제 비상 충돌 궤적에서 유지하는 crawl 속도 |
+| `minimum_non_emergency_speed` | `1.0` m/s | 비상 충돌 궤적이 아닐 때 유지하는 일반 최저 속도 |
+| `minimum_crawl_speed` | `0.3` m/s | 실제 비상 충돌 궤적에서 유지하는 crawl 속도 |
 | `speed_increase_start` | `3.0` m | 추가 속도 배율이 시작되는 안전거리 |
 | `speed_increase_end` | `15.0` m | 추가 속도 배율이 최대가 되는 안전거리 |
 | `speed_increase_factor` | `1.5` | 먼 공간에서 적용할 최대 속도 배율 |
@@ -237,9 +237,11 @@ RViz에는 다음 display를 추가합니다.
 | `lidar_offset_x` | `0.27` m | `base_link` 기준 LiDAR x 위치 |
 | `lidar_offset_y` | `0.0` m | `base_link` 기준 LiDAR y 위치 |
 | `gap_safety_margin` | `0.1` m | 선호 gap을 만들 때 차량 반경에 추가하는 벽 여유 |
-| `gap_fallback_distance` | `0.5` m | 선호 gap이 부족할 때 기본 반경 scan으로 재탐색하는 기준 |
+| `gap_fallback_distance` | `0.4` m | 선호 gap이 부족할 때 기본 반경 scan으로 재탐색하는 기준 |
 | `path_check_angle` | `30.0` deg | 후보 주변 안전거리 검사 반각이자 애매한 분기의 조향 제한 |
-| `safety_level` | `0.5` | 주변 거리 분포에서 사용할 위치. 0은 최소, 1은 최대 |
+| `safety_level` | `0.8` | gap 점수와 속도에 사용할 주변 거리 분포 위치 |
+| `candidate_safety_level` | `0.2` | path 및 회피 후보의 안전 통과 여부에 사용할 보수적 분포 위치 |
+| `candidate_min_clearance` | `0.5` m | path 및 회피 후보에 공통 적용할 최소 안전거리 |
 
 ### LiDAR 및 충돌검사
 
@@ -248,15 +250,15 @@ RViz에는 다음 display를 추가합니다.
 | `obstacle_edge_threshold` | `0.15` m | 장애물 경계로 판단할 인접 ray 거리 차이 |
 | `scan_filter_window` | `5` | 중앙값 필터 창 크기 |
 | `max_scan_angle` | `90.0` deg | 전방 기준 한쪽 시야각. 실제 사용 범위는 ±90도 |
-| `emergency_stop_distance` | `0.4` m | 예상 충돌이 이 거리 이내면 crawl 속도까지 감속 |
-| `enable_steering_before_crawl` | `true` | crawl 전에 안전한 대체 조향 궤적 탐색 |
-| `avoidance_min_clearance` | `0.6` m | 대체 조향이 만족해야 할 최소 LiDAR 안전거리 |
-| `avoidance_collision_free_distance` | `0.5` m | 대체 조향이 확보해야 할 충돌 없는 진행거리 |
 | `avoidance_steering_step` | `2.0` deg | 대체 조향 탐색 간격 |
 | `avoidance_steering_change_penalty` | `0.5` | 기존 gap 목표에서 크게 벗어나는 조향 억제값 |
+| `avoidance_direction_hold_time` | `0.6` s | 선택한 회피 방향을 최소 유지하는 시간 |
+| `avoidance_direction_min_angle` | `10.0` deg | 회피 방향 고정을 시작하고 유지할 최소 조향각 |
 | `trajectory_check_distance` | `1.0` m | 현재 조향 궤적을 검사할 거리 |
 | `trajectory_check_step` | `0.05` m | 궤적 샘플 간격 |
-| `trajectory_safety_margin` | `0.05` m | 궤적 충돌검사 반경에 추가하는 여유 |
+| `trajectory_safety_margin` | `0.05` m | 궤적 충돌 반경과 제동거리에 공통 적용하는 여유 |
+| `steering_feedback_topic` | `/ackermann_cmd` | 전환 궤적의 시작 조향으로 사용할 최종 명령 |
+| `steering_transition_time` | `0.20` s | 현재→목표 조향 전환시간이자 비상 TTC 기준 |
 | `initial_update_time` | `0.05` s | 첫 제어 주기의 가감속 계산 시간 |
 
 ### ROS 및 디버그
@@ -298,8 +300,6 @@ RViz에는 다음 display를 추가합니다.
 
 - 최저 속도: `minimum_crawl_speed`
 - 좁은 gap 속도: `narrow_gap_max_speed`
-- 충돌 감속 시작 거리: `emergency_stop_distance`
-- 조향 회피 가능 시 crawl 생략: `enable_steering_before_crawl`
 - 감속 강도: `max_deceleration`
 
 ## 한계
