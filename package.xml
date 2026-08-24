@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>gap_follow</name>
+  <name>gap_follow_ver2</name>
   <version>0.0.0</version>
-  <description>f1tenth gap_follow lab</description>
+  <description>F1TENTH gap follower with global-path steering preference</description>
   <maintainer email="zzang@seas.upenn.edu">zzangupenn</maintainer>
   <maintainer email="billyzheng.bz@gmail.com">Hongrui Zheng</maintainer>
   <license>MIT</license>

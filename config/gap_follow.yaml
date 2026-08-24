@@ -1,5 +1,5 @@
-gap_follow:
-  gap_follow:
+gap_follow_ver2:
+  gap_follow_ver2:
     ros__parameters:
       # ============================================================
       # 주행 방향 핵심 튜닝
@@ -166,6 +166,6 @@ gap_follow:
 
       lidar_scan_topic: /scan
       drive_topic: /drive_gf2
-      target_waypoint_topic: /gap_follow/target_waypoint
-      debug_marker_topic: /gap_follow/debug_markers
+      target_waypoint_topic: /gap_follow_ver2/target_waypoint
+      debug_marker_topic: /gap_follow_ver2/debug_markers
       command_frame_id: base_link

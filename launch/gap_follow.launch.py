@@ -5,14 +5,18 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    config_path = os.path.join(get_package_share_directory("gap_follow"), "config", "gap_follow.yaml")
+    config_path = os.path.join(
+        get_package_share_directory("gap_follow_ver2"),
+        "config",
+        "gap_follow.yaml",
+    )
 
-    gap_follow_node = Node(
-        package="gap_follow",
-        namespace="gap_follow",
-        executable="gap_follow",
-        name="gap_follow",
+    gap_follow_ver2_node = Node(
+        package="gap_follow_ver2",
+        namespace="gap_follow_ver2",
+        executable="gap_follow_ver2",
+        name="gap_follow_ver2",
         parameters=[config_path],
     )
 
-    return LaunchDescription([gap_follow_node])
+    return LaunchDescription([gap_follow_ver2_node])

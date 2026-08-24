@@ -1,4 +1,4 @@
-# Reactive Gap Follow
+# Reactive Gap Follow Ver2
 
 LiDAR로 주행 가능한 공간을 찾고 Ackermann 조향·속도 명령을 생성하는 ROS 2 패키지입니다. `/odom` localization과 최초 `/global_path`를 받아, 좌우 gap이 모두 안전할 때 path 방향의 gap을 우선합니다. path가 아직 없거나 localization이 오래되면 기존 LiDAR-only gap follower로 자동 복귀합니다.
 
@@ -111,16 +111,16 @@ collision_radius = vehicle_radius + trajectory_safety_margin
 
 ## ROS 인터페이스
 
-launch 실행 시 노드 전체 이름은 `/gap_follow/gap_follow`입니다.
+launch 실행 시 노드 전체 이름은 `/gap_follow_ver2/gap_follow_ver2`입니다. 기존 `gap_follow`와 동시에 실행할 수 있도록 노드 이름, namespace, 실행파일 및 출력 토픽을 분리했습니다.
 
 | 구분 | 기본 토픽 | 메시지 | 설명 |
 |---|---|---|---|
 | Subscribe | `/scan` | `sensor_msgs/msg/LaserScan` | 전방 장애물 및 gap 계산 입력 |
 | Subscribe | `/odom` | `nav_msgs/msg/Odometry` | path preference용 localization 입력 |
 | Subscribe | `/global_path` | `nav_msgs/msg/Path` | 최초 메시지만 고정 사용하는 reference path |
-| Publish | `/drive_gf` | `ackermann_msgs/msg/AckermannDriveStamped` | 조향각, 속도, 가속도 명령 |
-| Publish | `/gap_follow/target_waypoint` | `geometry_msgs/msg/PointStamped` | 선택한 로컬 목표점, `debug: true`일 때 발행 |
-| Publish | `/gap_follow/debug_markers` | `visualization_msgs/msg/MarkerArray` | 목표 방향, 예상 궤적, footprint, 상태 표시 |
+| Publish | `/drive_gf2` | `ackermann_msgs/msg/AckermannDriveStamped` | 조향각, 속도, 가속도 명령 |
+| Publish | `/gap_follow_ver2/target_waypoint` | `geometry_msgs/msg/PointStamped` | 선택한 로컬 목표점, `debug: true`일 때 발행 |
+| Publish | `/gap_follow_ver2/debug_markers` | `visualization_msgs/msg/MarkerArray` | 목표 방향, 예상 궤적, footprint, 상태 표시 |
 
 `target_waypoint`는 지도상의 global waypoint가 아니라 현재 LiDAR frame 기준의 최종 gap 목표점입니다.
 
@@ -132,12 +132,12 @@ ROS 2 Humble 환경을 기준으로 합니다.
 source /opt/ros/humble/setup.bash
 cd /home/rcv/Desktop/gap_follow
 rosdep install --from-paths . --ignore-src -r -y
-colcon build --packages-select gap_follow --symlink-install
+colcon build --packages-select gap_follow_ver2 --symlink-install
 source install/setup.bash
-ros2 launch gap_follow gap_follow.launch.py
+ros2 launch gap_follow_ver2 gap_follow.launch.py
 ```
 
-설정 파일은 [`config/gap_follow.yaml`](config/gap_follow.yaml)입니다. launch 파일이 `/gap_follow/gap_follow` 노드에 이 설정을 자동으로 적용합니다.
+설정 파일은 [`config/gap_follow.yaml`](config/gap_follow.yaml)입니다. launch 파일이 `/gap_follow_ver2/gap_follow_ver2` 노드에 이 설정을 자동으로 적용합니다.
 
 path 기능만 잠시 끄려면 `enable_path_guidance: false`로 설정하면 됩니다.
 
@@ -149,7 +149,7 @@ path 기능만 잠시 끄려면 `enable_path_guidance: false`로 설정하면 �
 source /opt/ros/humble/setup.bash
 cd /home/rcv/Desktop/gap_follow
 source install/setup.bash
-ros2 launch gap_follow gap_follow.launch.py
+ros2 launch gap_follow_ver2 gap_follow.launch.py
 ```
 
 터미널 2에서 bag을 재생합니다.
@@ -172,8 +172,8 @@ RViz에는 다음 display를 추가합니다.
 | Display | Topic | 용도 |
 |---|---|---|
 | `LaserScan` | `/scan` | 원본 LiDAR 확인 |
-| `MarkerArray` | `/gap_follow/debug_markers` | 목표 방향과 충돌검사 궤적 확인 |
-| `PointStamped` | `/gap_follow/target_waypoint` | 선택 목표점 확인 |
+| `MarkerArray` | `/gap_follow_ver2/debug_markers` | 목표 방향과 충돌검사 궤적 확인 |
+| `PointStamped` | `/gap_follow_ver2/target_waypoint` | 선택 목표점 확인 |
 
 `Fixed Frame`은 bag의 `/scan` 메시지에 기록된 frame을 사용합니다. 일반적으로 `base_link` 또는 LiDAR frame입니다. 마커가 보이지 않으면 `debug: true`, 토픽 이름, Fixed Frame과 TF 연결을 확인합니다.
 
@@ -266,9 +266,9 @@ RViz에는 다음 display를 추가합니다.
 | `default_qos` | `1` | publisher와 subscriber의 QoS depth |
 | `debug` | `true` | 목표점과 디버그 마커 발행 여부 |
 | `lidar_scan_topic` | `/scan` | LiDAR 입력 토픽 |
-| `drive_topic` | `/drive_gf` | Ackermann 명령 출력 토픽 |
-| `target_waypoint_topic` | `/gap_follow/target_waypoint` | 로컬 목표점 토픽 |
-| `debug_marker_topic` | `/gap_follow/debug_markers` | RViz 마커 토픽 |
+| `drive_topic` | `/drive_gf2` | Ackermann 명령 출력 토픽 |
+| `target_waypoint_topic` | `/gap_follow_ver2/target_waypoint` | 로컬 목표점 토픽 |
+| `debug_marker_topic` | `/gap_follow_ver2/debug_markers` | RViz 마커 토픽 |
 | `command_frame_id` | `base_link` | drive 명령 header의 frame ID |
 
 ## 튜닝 가이드

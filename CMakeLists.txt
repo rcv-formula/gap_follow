@@ -1,6 +1,6 @@
 # ============== BEGIN USER CONFIGURATION ==============
-set(PROJECT_NAME "gap_follow")
-set(EXECUTABLE_NAME "gap_follow")
+set(PROJECT_NAME "gap_follow_ver2")
+set(EXECUTABLE_NAME "gap_follow_ver2")
 set(CPP_FILE_PATH "src/gap_follow.cpp")
 set(IS_PACKAGE_EXECUTABLE TRUE)
 set(IS_PACKAGE_INTERFACE FALSE)

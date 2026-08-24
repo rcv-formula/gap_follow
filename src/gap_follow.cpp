@@ -26,7 +26,7 @@ int main(int argc, char** argv)
 
 ReactiveGapFollow::ReactiveGapFollow():
     Node(
-        "reactive_node",
+        "gap_follow_ver2",
         rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true))
 {
     const auto qos = static_cast<size_t>(this->get_parameter("default_qos").as_int());
@@ -563,7 +563,7 @@ void ReactiveGapFollow::publish_debug_markers(
 
     visualization_msgs::msg::Marker target_marker;
     target_marker.header = header;
-    target_marker.ns = "gap_follow";
+    target_marker.ns = "gap_follow_ver2";
     target_marker.id = 0;
     target_marker.type = visualization_msgs::msg::Marker::ARROW;
     target_marker.action = visualization_msgs::msg::Marker::ADD;
@@ -611,7 +611,7 @@ void ReactiveGapFollow::publish_debug_markers(
 
     visualization_msgs::msg::Marker trajectory_marker;
     trajectory_marker.header = header;
-    trajectory_marker.ns = "gap_follow";
+    trajectory_marker.ns = "gap_follow_ver2";
     trajectory_marker.id = 1;
     trajectory_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
     trajectory_marker.action = visualization_msgs::msg::Marker::ADD;
@@ -623,7 +623,7 @@ void ReactiveGapFollow::publish_debug_markers(
 
     visualization_msgs::msg::Marker footprint_marker;
     footprint_marker.header = header;
-    footprint_marker.ns = "gap_follow";
+    footprint_marker.ns = "gap_follow_ver2";
     footprint_marker.id = 2;
     footprint_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
     footprint_marker.action = visualization_msgs::msg::Marker::ADD;
@@ -655,7 +655,7 @@ void ReactiveGapFollow::publish_debug_markers(
 
     visualization_msgs::msg::Marker text_marker;
     text_marker.header = header;
-    text_marker.ns = "gap_follow";
+    text_marker.ns = "gap_follow_ver2";
     text_marker.id = 3;
     text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
     text_marker.action = visualization_msgs::msg::Marker::ADD;
