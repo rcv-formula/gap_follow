@@ -101,7 +101,7 @@ path 가산점은 다음 LiDAR 안전조건을 모두 만족한 후보에만 적
 collision_radius = vehicle_radius + trajectory_safety_margin
 ```
 
-선택한 강조향 경로가 가까운 거리에서 막히고 반대쪽 경로가 더 길게 안전하면 반대 방향으로 전환합니다. 단순히 정면 LiDAR 거리만 보는 것이 아니라 실제 명령 조향각에 따른 이동 궤적을 검사합니다.
+선택한 강조향 경로가 가까운 거리에서 막히면 crawl 감속 전에 전체 조향 범위를 다시 검사합니다. `avoidance_min_clearance` 이상의 gap이면서 `avoidance_collision_free_distance`까지 충돌이 없는 대체 조향이 발견되면 해당 방향으로 회피하고 기존 거리 기반 속도를 유지합니다. 모든 조향 궤적이 막혔을 때만 `minimum_crawl_speed`로 감속합니다.
 
 ### 6. 속도 제어
 
@@ -248,6 +248,11 @@ RViz에는 다음 display를 추가합니다.
 | `scan_filter_window` | `5` | 중앙값 필터 창 크기 |
 | `max_scan_angle` | `90.0` deg | 전방 기준 한쪽 시야각. 실제 사용 범위는 ±90도 |
 | `emergency_stop_distance` | `0.4` m | 예상 충돌이 이 거리 이내면 crawl 속도까지 감속 |
+| `enable_steering_before_crawl` | `true` | crawl 전에 안전한 대체 조향 궤적 탐색 |
+| `avoidance_min_clearance` | `0.6` m | 대체 조향이 만족해야 할 최소 LiDAR 안전거리 |
+| `avoidance_collision_free_distance` | `0.55` m | 대체 조향이 확보해야 할 충돌 없는 진행거리 |
+| `avoidance_steering_step` | `2.0` deg | 대체 조향 탐색 간격 |
+| `avoidance_steering_change_penalty` | `0.5` | 기존 gap 목표에서 크게 벗어나는 조향 억제값 |
 | `trajectory_check_distance` | `1.0` m | 현재 조향 궤적을 검사할 거리 |
 | `trajectory_check_step` | `0.05` m | 궤적 샘플 간격 |
 | `trajectory_safety_margin` | `0.05` m | 궤적 충돌검사 반경에 추가하는 여유 |
@@ -293,6 +298,7 @@ RViz에는 다음 display를 추가합니다.
 - 최저 속도: `minimum_crawl_speed`
 - 좁은 gap 속도: `narrow_gap_max_speed`
 - 충돌 감속 시작 거리: `emergency_stop_distance`
+- 조향 회피 가능 시 crawl 생략: `enable_steering_before_crawl`
 - 감속 강도: `max_deceleration`
 
 ## 한계

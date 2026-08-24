@@ -1202,6 +1202,100 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         : unsmoothed_target_angle;
     target_angle = clamp_steering(target_angle);
 
+    // Before accepting an emergency crawl, search the remaining steering range
+    // for a trajectory that clears the obstacle. This preserves normal
+    // distance-based speed when steering alone is sufficient, while keeping the
+    // original crawl fallback when every reachable trajectory is still blocked.
+    float collision_distance = this->get_trajectory_collision_distance(
+        raw_ranges,
+        first_scan_angle,
+        angle_increment,
+        scan_msg->range_max,
+        target_angle);
+    bool using_steering_avoidance = false;
+    if (this->get_parameter("enable_steering_before_crawl").as_bool()
+        && collision_distance
+            <= this->get_parameter("emergency_stop_distance").as_double())
+    {
+        const float scan_last_angle = first_scan_angle
+            + static_cast<float>(ranges.size() - 1) * angle_increment;
+        const float search_min_angle = std::max(
+            first_scan_angle, -maximum_steering_angle);
+        const float search_max_angle = std::min(
+            scan_last_angle, maximum_steering_angle);
+        const float search_step = std::max(
+            angle_increment,
+            static_cast<float>(
+                this->get_parameter("avoidance_steering_step").as_double()
+                * M_PI / 180.0));
+        const float minimum_clearance = std::max(
+            0.0F,
+            static_cast<float>(
+                this->get_parameter("avoidance_min_clearance").as_double()));
+        const float required_collision_distance = std::max(
+            static_cast<float>(
+                this->get_parameter("emergency_stop_distance").as_double()),
+            static_cast<float>(
+                this->get_parameter("avoidance_collision_free_distance").as_double()));
+        const float steering_change_penalty = std::max(
+            0.0F,
+            static_cast<float>(
+                this->get_parameter("avoidance_steering_change_penalty").as_double()));
+        const float distance_cap = std::max(
+            1.0e-3F,
+            static_cast<float>(
+                this->get_parameter("gap_score_distance_cap").as_double()));
+
+        float best_avoidance_score = -std::numeric_limits<float>::infinity();
+        float best_avoidance_angle = target_angle;
+        float best_avoidance_collision_distance = collision_distance;
+        for (float candidate_angle = search_min_angle;
+            candidate_angle <= search_max_angle + 0.5F * search_step;
+            candidate_angle += search_step)
+        {
+            const float checked_angle = std::min(candidate_angle, search_max_angle);
+            const float candidate_clearance = clearance_for_angle(checked_angle);
+            if (candidate_clearance < minimum_clearance)
+            {
+                continue;
+            }
+            const float candidate_collision_distance
+                = this->get_trajectory_collision_distance(
+                    raw_ranges,
+                    first_scan_angle,
+                    angle_increment,
+                    scan_msg->range_max,
+                    checked_angle);
+            if (std::isfinite(candidate_collision_distance)
+                && candidate_collision_distance < required_collision_distance)
+            {
+                continue;
+            }
+
+            const float candidate_score
+                = std::min(candidate_clearance, distance_cap)
+                - steering_change_penalty * std::abs(checked_angle - target_angle);
+            if (candidate_score > best_avoidance_score)
+            {
+                best_avoidance_score = candidate_score;
+                best_avoidance_angle = checked_angle;
+                best_avoidance_collision_distance = candidate_collision_distance;
+            }
+        }
+
+        if (std::isfinite(best_avoidance_score))
+        {
+            target_angle = best_avoidance_angle;
+            collision_distance = best_avoidance_collision_distance;
+            using_steering_avoidance = true;
+            // Do not blend the safe escape steering with older commands that
+            // point toward the collision that triggered this search.
+            steering_window.clear();
+            steering_sum = 0.0F;
+            target_angle = this->smooth_steering(target_angle);
+        }
+    }
+
     const size_t commanded_index = index_for_angle(target_angle);
 
     // Always use the physical-footprint scan for speed and emergency decisions.
@@ -1213,9 +1307,11 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
 
     // A close front wall is relevant while driving almost straight. In a corner,
     // use the selected gap direction so a wall in front does not force a false stop.
-    const float safe_distance = std::abs(target_angle) <= path_check_angle
-        ? std::min(target_distance, front_distance)
-        : target_distance;
+    const float safe_distance = using_steering_avoidance
+        ? target_distance
+        : (std::abs(target_angle) <= path_check_angle
+            ? std::min(target_distance, front_distance)
+            : target_distance);
 
     const auto command_time = this->now();
     new_msg.header.stamp = command_time;
@@ -1228,12 +1324,6 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             desired_speed,
             static_cast<float>(this->get_parameter("narrow_gap_max_speed").as_double()));
     }
-    const float collision_distance = this->get_trajectory_collision_distance(
-        raw_ranges,
-        first_scan_angle,
-        angle_increment,
-        scan_msg->range_max,
-        target_angle);
     float acceleration = 0.0;
     new_msg.drive.speed = limit_speed_change(
         desired_speed,
@@ -1256,6 +1346,14 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         this->publish_debug_markers(
             scan_msg->header, target_angle, target_distance, collision_distance,
             path_guidance);
+    }
+
+    if (using_steering_avoidance)
+    {
+        RCLCPP_DEBUG_THROTTLE(
+            this->get_logger(), *this->get_clock(), 500,
+            "Avoided emergency crawl with steering %.1f deg",
+            target_angle * 180.0F / static_cast<float>(M_PI));
     }
 };
 

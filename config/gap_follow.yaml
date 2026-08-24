@@ -131,6 +131,20 @@ gap_follow:
 
       # 이 거리 안에서 충돌이 예상되면 minimum_crawl_speed까지 감속
       emergency_stop_distance: 0.4
+
+      # crawl 감속 전에 전체 조향 범위에서 안전한 회피 궤적을 먼저 탐색.
+      # 아래 조건을 만족하는 조향이 있으면 crawl로 내리지 않고
+      # 기존 거리 기반 목표 속도를 유지함.
+      enable_steering_before_crawl: true
+      # 대체 조향 방향의 최소 LiDAR 안전거리
+      avoidance_min_clearance: 0.6
+      # 대체 궤적에서 확보해야 하는 최소 충돌 없는 진행거리
+      avoidance_collision_free_distance: 0.55
+      # 대체 조향 탐색 각도 간격
+      avoidance_steering_step: 2.0
+      # 기존 gap 목표와 지나치게 다른 조향을 억제하는 점수 페널티
+      avoidance_steering_change_penalty: 0.5
+
       # 충돌 여부를 검사할 진행 거리와 계산 간격
       trajectory_check_distance: 1.0
       trajectory_check_step: 0.05
