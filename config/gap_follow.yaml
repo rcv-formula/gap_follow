@@ -69,11 +69,14 @@ gap_follow:
       steering_smooth_window: 3
 
       # 기본 목표 속도 = 안전거리 * speed_factor
-      speed_factor: 0.2
+      speed_factor: 0.4
       max_speed: 4.0 # 1.8
       # 안전 여유가 부족한 좁은 gap에서의 속도 제한
       narrow_gap_max_speed: 1.5 # 0.5
-      # 장애물이 가까워도 완전히 정지하지 않고 유지할 최저 속도
+      # 비상이 아닐 때 유지하는 일반 주행 최저 속도.
+      # 장애물 회피 중에도 충돌 궤적이 아니면 이 속도 아래로 내리지 않음.
+      minimum_non_emergency_speed: 1.1
+      # 실제 비상 충돌 궤적에서 완전히 정지하지 않고 유지할 최저 속도
       minimum_crawl_speed: 0.8 # 0.20
 
       # 안전거리가 start에서 end로 증가할 때 속도 배율을
@@ -139,7 +142,7 @@ gap_follow:
       # 대체 조향 방향의 최소 LiDAR 안전거리
       avoidance_min_clearance: 0.6
       # 대체 궤적에서 확보해야 하는 최소 충돌 없는 진행거리
-      avoidance_collision_free_distance: 0.55
+      avoidance_collision_free_distance: 0.5
       # 대체 조향 탐색 각도 간격
       avoidance_steering_step: 2.0
       # 기존 gap 목표와 지나치게 다른 조향을 억제하는 점수 페널티

@@ -1372,11 +1372,13 @@ float ReactiveGapFollow::set_speed_from_distance(float distance, float steering_
     float desired_speed = std::min(
         std::min(speed, turning_speed),
         static_cast<float>(this->get_parameter("max_speed").as_double()));
-    // The trajectory collision check in limit_speed_change owns the hard-stop
-    // decision. A short straight-ahead LiDAR distance alone only reduces speed.
+    // Keep normal obstacle avoidance above a distinct non-emergency floor.
+    // limit_speed_change() is the only place allowed to command the lower crawl
+    // speed, and only when the selected trajectory is actually in collision.
     desired_speed = std::max(
         desired_speed,
-        static_cast<float>(this->get_parameter("minimum_crawl_speed").as_double()));
+        static_cast<float>(
+            this->get_parameter("minimum_non_emergency_speed").as_double()));
     return desired_speed;
 }
 

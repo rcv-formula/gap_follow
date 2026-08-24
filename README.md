@@ -215,15 +215,16 @@ RViz에는 다음 display를 추가합니다.
 |---|---:|---|
 | `max_steering_angle` | `45.0` deg | 명령 및 충돌검사에 사용하는 최대 조향각 |
 | `steering_smooth_window` | `3` | 최근 조향 명령 평균 개수 |
-| `speed_factor` | `0.2` | 안전거리에서 기본 속도로 변환하는 계수 |
-| `max_speed` | `1.8` m/s | 최대 속도 |
-| `narrow_gap_max_speed` | `0.5` m/s | 기본 차량 반경만으로 재탐색한 좁은 gap의 속도 제한 |
-| `minimum_crawl_speed` | `0.20` m/s | 가까운 장애물에서도 유지하는 최저 속도 |
+| `speed_factor` | `0.4` | 안전거리에서 기본 속도로 변환하는 계수 |
+| `max_speed` | `4.0` m/s | 최대 속도 |
+| `narrow_gap_max_speed` | `1.5` m/s | 기본 차량 반경만으로 재탐색한 좁은 gap의 속도 제한 |
+| `minimum_non_emergency_speed` | `1.1` m/s | 비상 충돌 궤적이 아닐 때 유지하는 일반 최저 속도 |
+| `minimum_crawl_speed` | `0.8` m/s | 실제 비상 충돌 궤적에서 유지하는 crawl 속도 |
 | `speed_increase_start` | `3.0` m | 추가 속도 배율이 시작되는 안전거리 |
 | `speed_increase_end` | `15.0` m | 추가 속도 배율이 최대가 되는 안전거리 |
 | `speed_increase_factor` | `1.5` | 먼 공간에서 적용할 최대 속도 배율 |
 | `min_acceleration` | `0.5` m/s² | 가까운 구간의 가속도 제한 |
-| `max_acceleration` | `4.0` m/s² | 열린 구간의 최대 가속도 제한 |
+| `max_acceleration` | `6.0` m/s² | 열린 구간의 최대 가속도 제한 |
 | `max_deceleration` | `6.0` m/s² | 최대 감속도 |
 
 ### 차량 형상 및 gap 안전 기준
@@ -250,7 +251,7 @@ RViz에는 다음 display를 추가합니다.
 | `emergency_stop_distance` | `0.4` m | 예상 충돌이 이 거리 이내면 crawl 속도까지 감속 |
 | `enable_steering_before_crawl` | `true` | crawl 전에 안전한 대체 조향 궤적 탐색 |
 | `avoidance_min_clearance` | `0.6` m | 대체 조향이 만족해야 할 최소 LiDAR 안전거리 |
-| `avoidance_collision_free_distance` | `0.55` m | 대체 조향이 확보해야 할 충돌 없는 진행거리 |
+| `avoidance_collision_free_distance` | `0.5` m | 대체 조향이 확보해야 할 충돌 없는 진행거리 |
 | `avoidance_steering_step` | `2.0` deg | 대체 조향 탐색 간격 |
 | `avoidance_steering_change_penalty` | `0.5` | 기존 gap 목표에서 크게 벗어나는 조향 억제값 |
 | `trajectory_check_distance` | `1.0` m | 현재 조향 궤적을 검사할 거리 |
