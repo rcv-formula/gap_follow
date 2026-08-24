@@ -42,13 +42,14 @@ gap_follow_ver2:
 
       # 평소 gap 점수에 더할 path 방향 preference와,
       # path에서 벗어났을 때 복귀를 위해 더 강하게 적용할 preference
-      path_guidance_weight: 1.0
-      path_rejoin_weight: 2.5
+      path_guidance_weight: 0.6
+      path_rejoin_weight: 1.0
       path_rejoin_distance: 0.5
+
 
       # 아래 LiDAR 안전조건을 모두 만족하는 후보에만 path 점수를 허용.
       # 따라서 global path 방향 앞이 막히면 preference는 적용되지 않음.
-      path_candidate_min_clearance: 1.0
+      path_candidate_min_clearance: 0.5
       path_candidate_min_score_ratio: 0.85
       path_candidate_min_clearance_ratio: 0.8
 
@@ -69,15 +70,15 @@ gap_follow_ver2:
       steering_smooth_window: 3
 
       # 기본 목표 속도 = 안전거리 * speed_factor
-      speed_factor: 0.4
-      max_speed: 4.0 # 1.8
+      speed_factor: 0.24
+      max_speed: 3.0 # 1.8
       # 안전 여유가 부족한 좁은 gap에서의 속도 제한
       narrow_gap_max_speed: 1.5 # 0.5
       # 비상이 아닐 때 유지하는 일반 주행 최저 속도.
       # 장애물 회피 중에도 충돌 궤적이 아니면 이 속도 아래로 내리지 않음.
-      minimum_non_emergency_speed: 1.1
+      minimum_non_emergency_speed: 1.0
       # 실제 비상 충돌 궤적에서 완전히 정지하지 않고 유지할 최저 속도
-      minimum_crawl_speed: 0.8 # 0.20
+      minimum_crawl_speed: 0.4 # 0.20
 
       # 안전거리가 start에서 end로 증가할 때 속도 배율을
       # 1.0에서 speed_increase_factor까지 증가
