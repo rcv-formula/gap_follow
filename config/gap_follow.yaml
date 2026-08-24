@@ -31,11 +31,11 @@ gap_follow:
 
       # 기본 목표 속도 = 안전거리 * speed_factor
       speed_factor: 0.2
-      max_speed: 1.8
+      max_speed: 4.0 # 1.8
       # 안전 여유가 부족한 좁은 gap에서의 속도 제한
-      narrow_gap_max_speed: 0.5
+      narrow_gap_max_speed: 1.5 # 0.5
       # 장애물이 가까워도 완전히 정지하지 않고 유지할 최저 속도
-      minimum_crawl_speed: 0.20
+      minimum_crawl_speed: 0.8 # 0.20
 
       # 안전거리가 start에서 end로 증가할 때 속도 배율을
       # 1.0에서 speed_increase_factor까지 증가
@@ -44,7 +44,7 @@ gap_follow:
       speed_increase_factor: 1.5
 
       min_acceleration: 0.5
-      max_acceleration: 4.0
+      max_acceleration: 6.0 # 4.0
       max_deceleration: 6.0
 
       # ============================================================
@@ -66,14 +66,14 @@ gap_follow:
       # 안전 여유를 적용한 gap이 이 거리보다 짧으면
       # vehicle_radius만 적용한 좁은 gap으로 다시 탐색
       # 좌우 gap 모두 주행 가능한지 판단하는 최소 거리로도 사용
-      gap_fallback_distance: 0.5
+      gap_fallback_distance: 0.4 # 0.5
 
       # 목표 방향 주변 ±각도에서 안전거리를 검사
       # 방향이 애매할 때 조향을 제한하는 각도로도 사용
       path_check_angle: 30.0
 
       # 0: 주변 최소 거리 / 1: 주변 최대 거리를 안전거리로 사용
-      safety_level: 0.5
+      safety_level: 0.8
 
       # ============================================================
       # LiDAR 전처리
