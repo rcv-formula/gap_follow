@@ -21,6 +21,45 @@ gap_follow:
       ambiguous_gap_opposite_weight: 2.0
 
       # ============================================================
+      # Localization 기반 reference path 조향 preference
+      # path는 속도가 아니라 gap 후보의 조향 점수에만 반영됨
+      # 최초 /global_path만 고정 사용하며 localization이 오래되면
+      # 기존 LiDAR-only gap follower로 동작
+      # ============================================================
+
+      enable_path_guidance: true
+      localization_topic: /odom
+      localization_timeout: 0.5
+
+      global_path_topic: /global_path
+      # 한 번만 발행되는 latched path도 노드 시작 후 받을 수 있게 설정.
+      # global_path publisher도 transient_local QoS를 제공해야 함.
+      global_path_transient_local: true
+      path_is_closed: true
+
+      # 현재 위치에서 path 진행방향으로 이 거리 앞을 조향 기준으로 사용
+      path_lookahead_distance: 1.2
+
+      # 평소 gap 점수에 더할 path 방향 preference와,
+      # path에서 벗어났을 때 복귀를 위해 더 강하게 적용할 preference
+      path_guidance_weight: 1.0
+      path_rejoin_weight: 2.5
+      path_rejoin_distance: 0.5
+
+      # 아래 LiDAR 안전조건을 모두 만족하는 후보에만 path 점수를 허용.
+      # 따라서 global path 방향 앞이 막히면 preference는 적용되지 않음.
+      path_candidate_min_clearance: 1.0
+      path_candidate_min_score_ratio: 0.85
+      path_candidate_min_clearance_ratio: 0.8
+
+      # path 방향에서 멀어진 gap 후보의 preference가 감소하는 각도 폭
+      path_alignment_sigma: 25.0
+      # lookahead 목표가 차량 뒤쪽에 있으면 guidance를 사용하지 않음
+      path_max_guidance_angle: 85.0
+      # 교차 구간에서 차량 진행방향과 같은 path segment를 고르는 가중치
+      path_heading_search_weight: 0.5
+
+      # ============================================================
       # 조향 및 속도 튜닝
       # ============================================================
 

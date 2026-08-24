@@ -10,6 +10,7 @@ set(DEPENDENCY_LIST
   "ament_cmake"
   "rclcpp"
   "geometry_msgs"
+  "nav_msgs"
   "ackermann_msgs"
   "sensor_msgs"
   "visualization_msgs"

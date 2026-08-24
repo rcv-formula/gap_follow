@@ -4,6 +4,18 @@
 #include <sstream>
 #include <utility>
 
+namespace
+{
+std::string normalized_frame(std::string frame)
+{
+    while (!frame.empty() && frame.front() == '/')
+    {
+        frame.erase(frame.begin());
+    }
+    return frame;
+}
+}  // namespace
+
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
@@ -33,6 +45,283 @@ ReactiveGapFollow::ReactiveGapFollow():
             {
                 this->lidar_callback(msg);
             });
+
+    if (this->get_parameter("enable_path_guidance").as_bool())
+    {
+        rclcpp::QoS path_qos(rclcpp::KeepLast(1));
+        path_qos.reliable();
+        if (this->get_parameter("global_path_transient_local").as_bool())
+        {
+            path_qos.transient_local();
+        }
+        else
+        {
+            path_qos.durability_volatile();
+        }
+        global_path_subscriber = this->create_subscription<nav_msgs::msg::Path>(
+            this->get_parameter("global_path_topic").as_string(),
+            path_qos,
+            [this](const nav_msgs::msg::Path::SharedPtr msg)
+            {
+                this->global_path_callback(msg);
+            });
+        localization_subscriber
+            = this->create_subscription<nav_msgs::msg::Odometry>(
+                this->get_parameter("localization_topic").as_string(),
+                qos,
+                [this](const nav_msgs::msg::Odometry::SharedPtr msg)
+                {
+                    this->localization_callback(msg);
+                });
+    }
+}
+
+double ReactiveGapFollow::normalize_angle(double angle)
+{
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+void ReactiveGapFollow::global_path_callback(const nav_msgs::msg::Path::SharedPtr msg)
+{
+    if (path_locked)
+    {
+        return;
+    }
+    if (!msg || msg->poses.size() < 2)
+    {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Ignoring global path with fewer than two poses");
+        return;
+    }
+
+    std::string path_frame = msg->header.frame_id;
+    if (path_frame.empty())
+    {
+        for (const auto& pose : msg->poses)
+        {
+            if (!pose.header.frame_id.empty())
+            {
+                path_frame = pose.header.frame_id;
+                break;
+            }
+        }
+    }
+    if (path_frame.empty())
+    {
+        RCLCPP_WARN(this->get_logger(), "Ignoring global path without a frame_id");
+        return;
+    }
+
+    std::vector<PathPoint> received_path;
+    received_path.reserve(msg->poses.size());
+    for (const auto& pose : msg->poses)
+    {
+        const double x = pose.pose.position.x;
+        const double y = pose.pose.position.y;
+        if (!std::isfinite(x) || !std::isfinite(y))
+        {
+            continue;
+        }
+        if (!received_path.empty())
+        {
+            const double dx = x - received_path.back().x;
+            const double dy = y - received_path.back().y;
+            if (dx * dx + dy * dy < 1.0e-8)
+            {
+                continue;
+            }
+        }
+        PathPoint point;
+        point.x = x;
+        point.y = y;
+        received_path.push_back(point);
+    }
+    if (received_path.size() < 2)
+    {
+        RCLCPP_WARN(this->get_logger(), "Ignoring global path without two valid distinct poses");
+        return;
+    }
+
+    reference_path = std::move(received_path);
+    reference_path_frame = normalized_frame(path_frame);
+    path_locked = true;
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Locked first global path with %zu poses in frame '%s'; later updates will be ignored",
+        reference_path.size(), reference_path_frame.c_str());
+}
+
+void ReactiveGapFollow::localization_callback(
+    const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    if (!msg)
+    {
+        return;
+    }
+    const auto& position = msg->pose.pose.position;
+    const auto& orientation = msg->pose.pose.orientation;
+    const double quaternion_norm = orientation.x * orientation.x
+        + orientation.y * orientation.y + orientation.z * orientation.z
+        + orientation.w * orientation.w;
+    if (!std::isfinite(position.x) || !std::isfinite(position.y)
+        || !std::isfinite(quaternion_norm) || quaternion_norm < 1.0e-8)
+    {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "Ignoring invalid localization pose");
+        return;
+    }
+
+    latest_localization = *msg;
+    latest_localization_receive_time = this->now();
+    has_localization = true;
+}
+
+ReactiveGapFollow::PathGuidance ReactiveGapFollow::get_path_guidance()
+{
+    PathGuidance guidance;
+    if (!this->get_parameter("enable_path_guidance").as_bool()
+        || reference_path.size() < 2 || !has_localization)
+    {
+        return guidance;
+    }
+
+    const double timeout = std::max(
+        0.0, this->get_parameter("localization_timeout").as_double());
+    const double pose_age = (this->now() - latest_localization_receive_time).seconds();
+    if (pose_age < 0.0 || pose_age > timeout)
+    {
+        return guidance;
+    }
+
+    const std::string& path_frame = reference_path_frame;
+    const std::string pose_frame = normalized_frame(latest_localization.header.frame_id);
+    if (pose_frame.empty() || path_frame != pose_frame)
+    {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 3000,
+            "Path frame '%s' differs from localization frame '%s'; path guidance disabled",
+            path_frame.c_str(), pose_frame.c_str());
+        return guidance;
+    }
+
+    const auto& pose = latest_localization.pose.pose;
+    const double sin_yaw = 2.0 * (
+        pose.orientation.w * pose.orientation.z
+        + pose.orientation.x * pose.orientation.y);
+    const double cos_yaw = 1.0 - 2.0 * (
+        pose.orientation.y * pose.orientation.y
+        + pose.orientation.z * pose.orientation.z);
+    const double yaw = std::atan2(sin_yaw, cos_yaw);
+    const bool closed_path = this->get_parameter("path_is_closed").as_bool();
+    const size_t segment_count = closed_path
+        ? reference_path.size() : reference_path.size() - 1;
+    const double heading_search_weight = std::max(
+        0.0, this->get_parameter("path_heading_search_weight").as_double());
+
+    size_t nearest_segment = 0;
+    double nearest_ratio = 0.0;
+    double nearest_distance_squared = std::numeric_limits<double>::infinity();
+    double best_metric = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < segment_count; ++i)
+    {
+        const PathPoint& start = reference_path[i];
+        const PathPoint& end = reference_path[(i + 1) % reference_path.size()];
+        const double segment_x = end.x - start.x;
+        const double segment_y = end.y - start.y;
+        const double length_squared = segment_x * segment_x + segment_y * segment_y;
+        if (length_squared < 1.0e-10)
+        {
+            continue;
+        }
+        const double ratio = std::max(
+            0.0, std::min(
+                ((pose.position.x - start.x) * segment_x
+                    + (pose.position.y - start.y) * segment_y) / length_squared,
+                1.0));
+        const double projected_x = start.x + ratio * segment_x;
+        const double projected_y = start.y + ratio * segment_y;
+        const double dx = pose.position.x - projected_x;
+        const double dy = pose.position.y - projected_y;
+        const double distance_squared = dx * dx + dy * dy;
+        const double segment_yaw = std::atan2(segment_y, segment_x);
+        const double heading_difference = normalize_angle(segment_yaw - yaw);
+        const double metric = std::sqrt(distance_squared)
+            + heading_search_weight * (1.0 - std::cos(heading_difference));
+        if (metric < best_metric)
+        {
+            best_metric = metric;
+            nearest_distance_squared = distance_squared;
+            nearest_segment = i;
+            nearest_ratio = ratio;
+        }
+    }
+
+    if (!std::isfinite(best_metric))
+    {
+        return guidance;
+    }
+
+    const double lookahead = std::max(
+        0.0, this->get_parameter("path_lookahead_distance").as_double());
+    PathPoint target;
+    const PathPoint& nearest_start = reference_path[nearest_segment];
+    const PathPoint& nearest_end
+        = reference_path[(nearest_segment + 1) % reference_path.size()];
+    target.x = nearest_start.x + nearest_ratio * (nearest_end.x - nearest_start.x);
+    target.y = nearest_start.y + nearest_ratio * (nearest_end.y - nearest_start.y);
+
+    double remaining = lookahead;
+    size_t segment = nearest_segment;
+    double ratio = nearest_ratio;
+    for (size_t visited = 0; visited <= segment_count && remaining > 0.0; ++visited)
+    {
+        const PathPoint& start = reference_path[segment];
+        const PathPoint& end = reference_path[(segment + 1) % reference_path.size()];
+        const double segment_x = end.x - start.x;
+        const double segment_y = end.y - start.y;
+        const double segment_length = std::hypot(segment_x, segment_y);
+        const double available = segment_length * (1.0 - ratio);
+        if (segment_length > 1.0e-8 && remaining <= available)
+        {
+            const double target_ratio = ratio + remaining / segment_length;
+            target.x = start.x + target_ratio * segment_x;
+            target.y = start.y + target_ratio * segment_y;
+            remaining = 0.0;
+            break;
+        }
+        target = end;
+        remaining -= available;
+        if (!closed_path && segment + 1 >= segment_count)
+        {
+            break;
+        }
+        segment = (segment + 1) % segment_count;
+        ratio = 0.0;
+    }
+
+    const double global_target_angle = std::atan2(
+        target.y - pose.position.y, target.x - pose.position.x);
+    guidance.target_angle = static_cast<float>(normalize_angle(global_target_angle - yaw));
+    guidance.cross_track_error = static_cast<float>(std::sqrt(nearest_distance_squared));
+    guidance.target = target;
+
+    const double max_guidance_angle = std::max(
+        0.0, this->get_parameter("path_max_guidance_angle").as_double())
+        * M_PI / 180.0;
+    if (std::abs(guidance.target_angle) > max_guidance_angle)
+    {
+        return guidance;
+    }
+
+    const double rejoin_distance = std::max(
+        0.0, this->get_parameter("path_rejoin_distance").as_double());
+    guidance.score_weight = static_cast<float>(guidance.cross_track_error > rejoin_distance
+        ? std::max(0.0, this->get_parameter("path_rejoin_weight").as_double())
+        : std::max(0.0, this->get_parameter("path_guidance_weight").as_double()));
+    guidance.active = guidance.score_weight > 0.0F;
+    return guidance;
 }
 
 // Preprocess lidar points to remove invalid points
@@ -267,7 +556,8 @@ void ReactiveGapFollow::publish_debug_markers(
     const std_msgs::msg::Header& header,
     float steering_angle,
     float target_distance,
-    float collision_distance)
+    float collision_distance,
+    const PathGuidance& path_guidance)
 {
     visualization_msgs::msg::MarkerArray marker_array;
 
@@ -380,8 +670,67 @@ void ReactiveGapFollow::publish_debug_markers(
     std::ostringstream status;
     status << (emergency ? "STOP" : "CLEAR") << "  steer="
            << steering_angle * 180.0F / static_cast<float>(M_PI) << " deg";
+    if (path_guidance.active)
+    {
+        status << "  path="
+               << path_guidance.target_angle * 180.0F / static_cast<float>(M_PI)
+               << " deg  error=" << path_guidance.cross_track_error << " m";
+    }
     text_marker.text = status.str();
     marker_array.markers.push_back(text_marker);
+
+    if (!reference_path.empty())
+    {
+        visualization_msgs::msg::Marker path_marker;
+        path_marker.header.stamp = header.stamp;
+        path_marker.header.frame_id = reference_path_frame;
+        path_marker.ns = "reference_path";
+        path_marker.id = 10;
+        path_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        path_marker.action = visualization_msgs::msg::Marker::ADD;
+        path_marker.scale.x = 0.04;
+        path_marker.color.r = 0.9F;
+        path_marker.color.g = 0.7F;
+        path_marker.color.b = 0.1F;
+        path_marker.color.a = 0.65F;
+        for (const auto& path_point : reference_path)
+        {
+            geometry_msgs::msg::Point point;
+            point.x = path_point.x;
+            point.y = path_point.y;
+            point.z = 0.02;
+            path_marker.points.push_back(point);
+        }
+        if (this->get_parameter("path_is_closed").as_bool()
+            && reference_path.size() > 1)
+        {
+            path_marker.points.push_back(path_marker.points.front());
+        }
+        marker_array.markers.push_back(path_marker);
+    }
+
+    if (path_guidance.active)
+    {
+        visualization_msgs::msg::Marker path_target_marker;
+        path_target_marker.header.stamp = header.stamp;
+        path_target_marker.header.frame_id = reference_path_frame;
+        path_target_marker.ns = "reference_path";
+        path_target_marker.id = 11;
+        path_target_marker.type = visualization_msgs::msg::Marker::SPHERE;
+        path_target_marker.action = visualization_msgs::msg::Marker::ADD;
+        path_target_marker.pose.position.x = path_guidance.target.x;
+        path_target_marker.pose.position.y = path_guidance.target.y;
+        path_target_marker.pose.position.z = 0.08;
+        path_target_marker.pose.orientation.w = 1.0;
+        path_target_marker.scale.x = 0.18;
+        path_target_marker.scale.y = 0.18;
+        path_target_marker.scale.z = 0.18;
+        path_target_marker.color.r = 1.0F;
+        path_target_marker.color.g = 0.2F;
+        path_target_marker.color.b = 0.8F;
+        path_target_marker.color.a = 0.95F;
+        marker_array.markers.push_back(path_target_marker);
+    }
 
     marker_publisher->publish(marker_array);
 }
@@ -405,11 +754,16 @@ float ReactiveGapFollow::get_safe_distance(const std::vector<float>& ranges, siz
 size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
                                              size_t check_width,
                                              float safety_level,
+                                             float first_scan_angle,
+                                             float angle_increment,
+                                             const PathGuidance& path_guidance,
                                              float& target_distance,
-                                             float& target_score) const
+                                             float& target_score,
+                                             bool& path_preference_applied) const
 {
     target_distance = 0.0;
     target_score = 0.0F;
+    path_preference_applied = false;
     if (ranges.empty())
     {
         return 0;
@@ -426,8 +780,14 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
         search_begin = 0;
     }
 
-    size_t best_index = search_begin;
-    float best_score = -std::numeric_limits<float>::infinity();
+    struct Candidate
+    {
+        float safe_distance = 0.0F;
+        float base_score = -std::numeric_limits<float>::infinity();
+    };
+    std::vector<Candidate> candidates(ranges.size());
+    size_t lidar_best_index = search_begin;
+    float lidar_best_score = -std::numeric_limits<float>::infinity();
     const float gap_width_preference = std::max(
         0.0F,
         std::min(
@@ -467,14 +827,71 @@ size_t ReactiveGapFollow::find_target_index(const std::vector<float>& ranges,
             / static_cast<float>(width_end - width_begin + 1);
         const float capped_safe_distance = std::min(safe_distance, distance_cap);
 
-        const float score
+        const float base_score
             = (1.0F - gap_width_preference) * capped_safe_distance
             + gap_width_preference * width_score;
+        candidates[i].safe_distance = safe_distance;
+        candidates[i].base_score = base_score;
+        if (base_score > lidar_best_score)
+        {
+            lidar_best_score = base_score;
+            lidar_best_index = i;
+        }
+    }
+
+    // Path is only a tie-breaker among candidates that are already comparable
+    // to the lidar-only best gap. It can never make a blocked/narrow direction
+    // eligible merely because the global path points that way.
+    const float minimum_clearance = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("path_candidate_min_clearance").as_double()));
+    const float minimum_score_ratio = std::max(
+        0.0F,
+        std::min(
+            1.0F,
+            static_cast<float>(
+                this->get_parameter("path_candidate_min_score_ratio").as_double())));
+    const float minimum_clearance_ratio = std::max(
+        0.0F,
+        std::min(
+            1.0F,
+            static_cast<float>(
+                this->get_parameter("path_candidate_min_clearance_ratio").as_double())));
+    const float lidar_best_clearance = candidates[lidar_best_index].safe_distance;
+
+    size_t best_index = lidar_best_index;
+    float best_score = -std::numeric_limits<float>::infinity();
+    for (size_t i = search_begin; i <= search_end; ++i)
+    {
+        float score = candidates[i].base_score;
+        const bool path_safe_candidate = path_guidance.active
+            && candidates[i].safe_distance >= minimum_clearance
+            && candidates[i].safe_distance
+                >= lidar_best_clearance * minimum_clearance_ratio
+            && candidates[i].base_score >= lidar_best_score * minimum_score_ratio;
+        if (path_safe_candidate)
+        {
+            const float candidate_angle
+                = first_scan_angle + static_cast<float>(i) * angle_increment;
+            const float difference = static_cast<float>(normalize_angle(
+                candidate_angle - path_guidance.target_angle));
+            const float alignment_sigma = std::max(
+                1.0e-3F,
+                static_cast<float>(
+                    this->get_parameter("path_alignment_sigma").as_double()
+                    * M_PI / 180.0));
+            const float normalized_difference = difference / alignment_sigma;
+            const float alignment = std::exp(
+                -0.5F * normalized_difference * normalized_difference);
+            score += path_guidance.score_weight * alignment;
+        }
         if (score > best_score)
         {
             best_score = score;
             best_index = i;
-            target_distance = safe_distance;
+            target_distance = candidates[i].safe_distance;
+            path_preference_applied = path_safe_candidate;
         }
     }
 
@@ -548,14 +965,20 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     const size_t path_check_width = static_cast<size_t>(std::ceil(
         path_check_angle / angle_increment));
     const float safety_level = this->get_parameter("safety_level").as_double();
+    const PathGuidance path_guidance = this->get_path_guidance();
     float preferred_target_distance = 0.0;
     float target_score = 0.0F;
+    bool selected_path_preference_applied = false;
     size_t target_index = this->find_target_index(
         preferred_ranges,
         path_check_width,
         safety_level,
+        first_scan_angle,
+        angle_increment,
+        path_guidance,
         preferred_target_distance,
-        target_score);
+        target_score,
+        selected_path_preference_applied);
 
     const float fallback_distance = static_cast<float>(
         this->get_parameter("gap_fallback_distance").as_double());
@@ -567,8 +990,12 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             ranges,
             path_check_width,
             safety_level,
+            first_scan_angle,
+            angle_increment,
+            path_guidance,
             selected_target_distance,
-            target_score);
+            target_score,
+            selected_path_preference_applied);
     }
 
     float target_angle = first_scan_angle + static_cast<float>(target_index) * angle_increment;
@@ -641,21 +1068,39 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 0.0F);
         }
 
+        bool opposite_path_preference_applied = false;
         const size_t opposite_target_index = this->find_target_index(
             opposite_ranges,
             path_check_width,
             safety_level,
+            first_scan_angle,
+            angle_increment,
+            path_guidance,
             opposite_target_distance,
-            opposite_target_score);
+            opposite_target_score,
+            opposite_path_preference_applied);
         opposite_target_angle = clamp_steering(
             first_scan_angle
             + static_cast<float>(opposite_target_index) * angle_increment);
+
+        // When both directions passed the lidar safety gate, a valid reference
+        // path is the intended tie-breaker. Do not let the legacy ambiguous-fork
+        // neutralization average that resolved choice back toward the other side.
+        // If the path-side candidate was unsafe, it never received a path bonus,
+        // so the selected gap will not satisfy this directional comparison.
+        const float selected_path_difference = static_cast<float>(std::abs(
+            normalize_angle(target_angle - path_guidance.target_angle)));
+        const float opposite_path_difference = static_cast<float>(std::abs(
+            normalize_angle(opposite_target_angle - path_guidance.target_angle)));
+        const bool path_resolves_ambiguity = selected_path_preference_applied
+            && selected_path_difference + angle_increment < opposite_path_difference;
 
         limiting_ambiguous_gap
             = selected_target_distance > fallback_distance
             && opposite_target_distance > fallback_distance
             && target_score
-                <= opposite_target_score + ambiguous_gap_score_margin;
+                <= opposite_target_score + ambiguous_gap_score_margin
+            && !path_resolves_ambiguity;
         if (limiting_ambiguous_gap)
         {
             const float lateral_opening_angle = std::max(
@@ -809,7 +1254,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         target_waypoint_msg.point.y = target_distance * std::sin(target_angle);
         target_publisher->publish(target_waypoint_msg);
         this->publish_debug_markers(
-            scan_msg->header, target_angle, target_distance, collision_distance);
+            scan_msg->header, target_angle, target_distance, collision_distance,
+            path_guidance);
     }
 };
 
