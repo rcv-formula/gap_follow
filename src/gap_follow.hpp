@@ -59,12 +59,14 @@ class ReactiveGapFollow : public rclcpp::Node
     int get_cover_count(double radius, double distance, double angle_increment);
     void cover_scan_points(std::vector<float> &ranges, int direction, int count, int start_index);
     void expand_obstacles(std::vector<float> &ranges, std::vector<int> &obstacle_edges,
-                          double vehicle_radius, double angle_increment);
+                          double half_vehicle_width, double angle_increment);
     std::vector<float> filter_ranges(const std::vector<float>& ranges) const;
     TrajectoryRisk get_transition_trajectory_risk(
         const std::vector<std::pair<float, float>>& obstacle_points,
         float current_steering_angle, float target_steering_angle,
         float speed, float check_distance) const;
+    float get_curvature_gain(float speed) const;
+    float get_modeled_curvature(float steering_angle, float speed) const;
     float get_safe_distance(const std::vector<float>& ranges, size_t center_index,
                               size_t check_width, float safety_level) const;
     size_t find_target_index(const std::vector<float>& ranges, size_t check_width,
@@ -78,10 +80,11 @@ class ReactiveGapFollow : public rclcpp::Node
         const std_msgs::msg::Header& header, float steering_angle,
         float target_distance, float collision_distance,
         const PathGuidance& path_guidance, float current_steering_angle,
-        float collision_ttc, float braking_distance,
+        float prediction_speed, float collision_ttc, float braking_distance,
         bool emergency, bool braking_for_risk);
 
-    float set_speed_from_distance(float distance, float steering_angle);
+    float set_speed_from_distance(
+        float distance, float steering_angle, float actual_speed);
     float get_speed_increase_ratio(float distance) const;
     float limit_speed_change(
         float desired_speed, float distance, float steering_angle, bool emergency,
