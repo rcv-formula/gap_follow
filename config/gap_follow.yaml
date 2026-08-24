@@ -165,7 +165,7 @@ gap_follow:
       debug: true
 
       lidar_scan_topic: /scan
-      drive_topic: /drive_gf
+      drive_topic: /drive_gf2
       target_waypoint_topic: /gap_follow/target_waypoint
       debug_marker_topic: /gap_follow/debug_markers
       command_frame_id: base_link

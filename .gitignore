@@ -6,3 +6,5 @@
 /config/gap_follow_bag.rviz
 /config/rosbag_qos.yaml
 /launch/gap_follow_bag_rviz.launch.py
+/.eval_scan_qos.yaml
+/test_12/
