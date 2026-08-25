@@ -44,8 +44,8 @@ gap_follow_ver2:
       # 평소 gap 점수에 더할 path 방향 preference와,
       # path에서 벗어났을 때 복귀를 위해 더 강하게 적용할 preference
       path_guidance_weight: 0.6
-      path_rejoin_weight: 2.0
-      path_rejoin_distance: 0.5
+      path_rejoin_weight: 2.2
+      path_rejoin_distance: 0.3
 
 
       # 아래 LiDAR 안전조건을 모두 만족하는 후보에만 path 점수를 허용.
@@ -69,13 +69,13 @@ gap_follow_ver2:
       steering_smooth_window: 3
 
       # 기본 목표 속도 = 안전거리 * speed_factor
-      speed_factor: 0.24
+      speed_factor: 0.22
       max_speed: 3.0 # 1.8
       # 안전 여유가 부족한 좁은 gap에서의 속도 제한
       narrow_gap_max_speed: 1.5 # 0.5
       # 비상이 아닐 때 유지하는 일반 주행 최저 속도.
       # 장애물 회피 중에도 충돌 궤적이 아니면 이 속도 아래로 내리지 않음.
-      minimum_non_emergency_speed: 1.0
+      minimum_non_emergency_speed: 0.7
       # 실제 비상 충돌 궤적에서 완전히 정지하지 않고 유지할 최저 속도
       minimum_crawl_speed: 0.3
 
@@ -107,7 +107,7 @@ gap_follow_ver2:
       curvature_gain_min: 0.60
       curvature_gain_max: 1.25
       # base_link 중심 직사각형 차량 footprint
-      vehicle_width: 0.30
+      vehicle_width: 0.36
       vehicle_length: 0.55
 
       # base_link 기준 LiDAR 장착 위치 (0818 bag의 TF 기준)
@@ -115,7 +115,7 @@ gap_follow_ver2:
       lidar_offset_y: 0.0
 
       # 장애물 확장 시 차량 반폭에 추가할 안전 여유
-      gap_safety_margin: 0.1
+      gap_safety_margin: 0.3
 
       # 안전 여유를 적용한 gap이 이 거리보다 짧으면
       # 차량 반폭만 적용한 좁은 gap으로 다시 탐색
@@ -124,13 +124,13 @@ gap_follow_ver2:
 
       # 목표 방향 주변 ±각도에서 안전거리를 검사
       # 방향이 애매할 때 조향을 제한하는 각도로도 사용
-      path_check_angle: 30.0
+      path_check_angle: 45.0
 
       # 0: 주변 최소 거리 / 1: 주변 최대 거리를 안전거리로 사용
-      safety_level: 0.8
+      safety_level: 0.7
       # path preference 및 회피 조향의 통과 여부만 더 보수적으로 검사.
       # gap 점수와 속도 계산에는 위 safety_level을 계속 사용함.
-      candidate_safety_level: 0.4
+      candidate_safety_level: 0.45
       # path preference와 대체 회피 조향에 공통 적용할 최소 안전거리
       candidate_min_clearance: 0.5
 
@@ -155,9 +155,9 @@ gap_follow_ver2:
       # 대체 조향 탐색 각도 간격
       avoidance_steering_step: 2.0
       # 기존 gap 목표와 지나치게 다른 조향을 억제하는 점수 페널티
-      avoidance_steering_change_penalty: 0.5
+      avoidance_steering_change_penalty: 0.3
       # 장애물 회피 방향을 정한 뒤 최소한 유지할 시간
-      avoidance_direction_hold_time: 0.6
+      avoidance_direction_hold_time: 0.4
       # 방향 고정을 시작하고 유지할 최소 조향각
       avoidance_direction_min_angle: 10.0
 
