@@ -138,6 +138,18 @@ class ReactiveGapFollow : public rclcpp::Node
     rclcpp::Time latest_steering_feedback_receive_time{0, 0, RCL_ROS_TIME};
     bool has_steering_feedback = false;
 
+    // Object-relative rejoin guard. This is not a timed steering latch: it
+    // preserves the path-relative detour side only until the vehicle rear has
+    // crossed a fixed blocker pass line, and only while that side still has a
+    // collision-free candidate.
+    bool blocker_pass_guard_active = false;
+    int blocker_pass_guard_side = 0;
+    double blocker_pass_path_unit_x = 1.0;
+    double blocker_pass_path_unit_y = 0.0;
+    double blocker_pass_release_progress = 0.0;
+    double blocker_pass_start_x = 0.0;
+    double blocker_pass_start_y = 0.0;
+
     rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_publisher;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr localization_subscriber;
