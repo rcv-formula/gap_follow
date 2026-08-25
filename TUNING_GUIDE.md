@@ -294,6 +294,8 @@ curvature_gain(v) = clamp(1 / (0.71 + 0.59 × v²), 0.60, 1.25)
 - `normal_deceleration: 3.0`: 안전한 회피 조향이 없을 때 미리 적용하는 감속도이자 제동거리 계산값
 - `max_deceleration: 6.0`: TTC가 `steering_transition_time` 이하인 실제 비상상황 감속도
 
+회피 방향의 동적 제동 horizon이 완전히 충돌 없으면 장애물 옆의 짧은 LiDAR 거리만으로는 감속하지 않습니다. latch 진입 시 실제 odom 속도와 명령 속도 중 큰 값을 저장하고, 그 진입 속도로 늘어난 제동 horizon의 궤적까지 `steering_transition_time` 동안 연속으로 안전하면 해당 속도까지 점진적으로 유지·복원합니다. 단, 강조향 선회 속도와 `narrow_gap_max_speed`, `max_speed` 상한은 유지되고 BRAKE/STOP이 발생하면 복원을 즉시 중단합니다. 따라서 안전한 회피인데 느린 경우에는 `speed_factor`보다 먼저 debug 상태가 `CLEAR`인지, 실제 속도 제한 원인이 선회 상한인지 좁은 gap 상한인지 확인합니다.
+
 평상시 감속이 너무 급하면 `normal_deceleration: 3.0 → 2.5`로 낮추면 더 일찍, 더 완만하게 감속합니다. `max_deceleration`은 충돌 직전 비상용이므로 실제 차량이 낼 수 있는 최대 감속도 이내로 유지해야 합니다.
 
 ## 10. 센서 노이즈와 계산량

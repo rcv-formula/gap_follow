@@ -135,7 +135,7 @@ modeled_curvature = ideal_curvature × curvature_gain(v)
 
 ### 6. 속도 제어
 
-기본 목표 속도는 안전거리에 `speed_factor`를 곱해 계산하며, 먼 공간에서는 `speed_increase_factor`만큼 점진적으로 증가합니다. 조향이 클 때는 마찰계수와 실측 속도별 곡률로 계산한 선회 속도 한계를 적용합니다.
+기본 목표 속도는 안전거리에 `speed_factor`를 곱해 계산하며, 먼 공간에서는 `speed_increase_factor`만큼 점진적으로 증가합니다. 조향이 클 때는 마찰계수와 실측 속도별 곡률로 계산한 선회 속도 한계를 적용합니다. 회피 방향을 latch했거나 안전한 대체 조향을 사용 중이고, 동적 제동 horizon 전체의 직사각형 전환 궤적이 충돌 없이 안전하면 장애물 옆 LiDAR 거리만으로 추가 감속하지 않습니다. latch가 시작될 때 실제 odom 속도와 명령 속도 중 큰 값을 회피 진입 속도로 저장하고, 그 진입 속도로 늘어난 제동 horizon의 궤적까지 `steering_transition_time` 동안 연속으로 안전하면 해당 속도까지 점진적으로 유지·복원합니다. 선회 속도, `narrow_gap_max_speed`, `max_speed` 상한은 계속 적용하며 BRAKE/STOP이 발생하면 복원을 즉시 중단합니다.
 
 제동거리는 `steering_transition_time`, `/odom` 속도, `normal_deceleration`, `trajectory_safety_margin`으로 계산합니다. 전환 궤적이 horizon 끝까지 안전한 조향이 하나라도 있으면 감속하지 않습니다. 모든 조향이 위험하면 충돌거리에서 `normal_deceleration`으로 정지 가능한 속도를 즉시 역산하여 완만하게 감속하고, TTC가 `steering_transition_time`보다 짧아진 실제 비상상황에서만 `max_deceleration`으로 `minimum_crawl_speed`를 향해 감속합니다.
 

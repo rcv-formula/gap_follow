@@ -1595,6 +1595,11 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         pending_avoidance_direction = 0;
         pending_avoidance_direction_start_time = 0;
     };
+    const auto reset_avoidance_speed_state = [&]()
+    {
+        avoidance_entry_speed = 0.0F;
+        avoidance_speed_safe_start_time = 0;
+    };
     if (avoidance_direction != 0
         && decision_time_ns < avoidance_direction_start_time)
     {
@@ -1605,6 +1610,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         avoidance_direction_switched = false;
         reset_pending_direction_switch();
         avoidance_obstacle_locked = false;
+        reset_avoidance_speed_state();
     }
 
     const float straight_guard_clearance = guard_clearance_for_angle(0.0F);
@@ -1727,6 +1733,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 avoidance_direction_switched = false;
                 reset_pending_direction_switch();
                 avoidance_obstacle_locked = false;
+                reset_avoidance_speed_state();
             }
         }
         else
@@ -1784,6 +1791,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 avoidance_direction_switched = false;
                 reset_pending_direction_switch();
                 avoidance_obstacle_locked = false;
+                reset_avoidance_speed_state();
                 apply_avoidance_candidate(path_rejoin_candidate);
             }
         }
@@ -1847,6 +1855,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         avoidance_direction_start_time = decision_time_ns;
         avoidance_clear_start_time = 0;
         avoidance_direction_switched = true;
+        avoidance_speed_safe_start_time = 0;
         reset_pending_direction_switch();
         apply_avoidance_candidate(opposite_candidate);
         return true;
@@ -2008,6 +2017,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         avoidance_direction_start_time = decision_time_ns;
         avoidance_clear_start_time = 0;
         avoidance_direction_switched = false;
+        avoidance_entry_speed = std::max(actual_speed, current_speed);
+        avoidance_speed_safe_start_time = decision_time_ns;
         reset_pending_direction_switch();
         lock_avoidance_obstacle(latch_trigger_risk);
         RCLCPP_DEBUG(
@@ -2066,6 +2077,69 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     new_msg.drive.steering_angle = target_angle;
     float desired_speed = set_speed_from_distance(
         safe_distance, target_angle, actual_speed);
+    const bool preserve_safe_avoidance_speed
+        = final_trajectory_is_safe
+        && !braking_for_risk
+        && (avoidance_direction != 0 || using_steering_avoidance);
+    if (preserve_safe_avoidance_speed)
+    {
+        // Do not reduce speed merely because the selected LiDAR direction
+        // passes close to the obstacle. Retain the current command immediately.
+        // Recover the latched entry speed only after the exact transition is
+        // also collision-free at that higher speed and its longer brake horizon.
+        const float speed_ceiling_distance = std::max(
+            safe_distance,
+            static_cast<float>(
+                this->get_parameter("speed_increase_end").as_double()));
+        const float safe_avoidance_speed_ceiling = set_speed_from_distance(
+            speed_ceiling_distance, target_angle, actual_speed);
+        const float retained_speed = std::min(
+            current_speed, safe_avoidance_speed_ceiling);
+        float safe_avoidance_speed_floor = retained_speed;
+        if (avoidance_direction != 0)
+        {
+            const float entry_speed_target = std::min(
+                avoidance_entry_speed, safe_avoidance_speed_ceiling);
+            const float entry_speed_braking_distance
+                = entry_speed_target * brake_reaction_time
+                + entry_speed_target * entry_speed_target
+                    / (2.0F * braking_deceleration)
+                + braking_margin;
+            const float entry_speed_check_distance = std::max(
+                trajectory_check_distance, entry_speed_braking_distance);
+            const TrajectoryRisk entry_speed_risk
+                = this->get_transition_trajectory_risk(
+                    obstacle_points,
+                    current_steering_angle,
+                    target_angle,
+                    entry_speed_target,
+                    entry_speed_check_distance);
+            const bool entry_speed_trajectory_is_safe
+                = !std::isfinite(entry_speed_risk.collision_distance);
+            if (!entry_speed_trajectory_is_safe)
+            {
+                avoidance_speed_safe_start_time = 0;
+            }
+            else
+            {
+                if (avoidance_speed_safe_start_time == 0)
+                {
+                    avoidance_speed_safe_start_time = decision_time_ns;
+                }
+                const double safe_seconds = static_cast<double>(
+                    decision_time_ns - avoidance_speed_safe_start_time) * 1.0e-9;
+                if (safe_seconds >= direction_switch_confirmation_time)
+                {
+                    safe_avoidance_speed_floor = entry_speed_target;
+                }
+            }
+        }
+        desired_speed = std::max(desired_speed, safe_avoidance_speed_floor);
+    }
+    else if (avoidance_direction != 0)
+    {
+        avoidance_speed_safe_start_time = 0;
+    }
     if (using_narrow_gap)
     {
         desired_speed = std::min(

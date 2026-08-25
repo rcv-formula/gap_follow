@@ -104,6 +104,11 @@ class ReactiveGapFollow : public rclcpp::Node
     int avoidance_direction = 0;
     int64_t avoidance_direction_start_time = 0;
     int64_t avoidance_clear_start_time = 0;
+    // Preserve the approach speed for a safe avoidance episode. Recovery is
+    // enabled only after the selected trajectory stays safe for one steering
+    // transition, and remains subject to all normal speed ceilings.
+    float avoidance_entry_speed = 0.0F;
+    int64_t avoidance_speed_safe_start_time = 0;
     // An obstacle episode may correct its initially chosen side once, but it
     // must not bounce back and forth as individual scan candidates flicker.
     bool avoidance_direction_switched = false;
