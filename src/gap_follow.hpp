@@ -28,12 +28,18 @@ class ReactiveGapFollow : public rclcpp::Node
     {
         double x = 0.0;
         double y = 0.0;
+        double speed = std::numeric_limits<double>::quiet_NaN();
     };
 
     struct PathGuidance
     {
+        // A geometrically computed path target remains available for recovery
+        // even when its bearing is too large for ordinary gap-score guidance.
+        bool available = false;
         bool active = false;
+        bool speed_available = false;
         float target_angle = 0.0F;
+        float target_speed = 0.0F;
         float cross_track_error = 0.0F;
         float score_weight = 0.0F;
         PathPoint target;
@@ -49,6 +55,7 @@ class ReactiveGapFollow : public rclcpp::Node
 
     void global_path_callback(const nav_msgs::msg::Path::SharedPtr msg);
     void localization_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
+    void speed_odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void steering_feedback_callback(
         const ackermann_msgs::msg::AckermannDriveStamped::SharedPtr msg);
     PathGuidance get_path_guidance();
@@ -66,9 +73,13 @@ class ReactiveGapFollow : public rclcpp::Node
     TrajectoryRisk get_transition_trajectory_risk(
         const std::vector<std::pair<float, float>>& obstacle_points,
         float current_steering_angle, float target_steering_angle,
-        float speed, float check_distance) const;
-    float get_curvature_gain(float speed) const;
-    float get_modeled_curvature(float steering_angle, float speed) const;
+        float vehicle_speed, float check_distance) const;
+    float get_modeled_curvature(float steering_angle, float vehicle_speed) const;
+    float get_turning_speed_limit(
+        float steering_angle, float speed_reference) const;
+    float get_speed_calibration_factor() const;
+    float wheel_speed_to_vehicle_speed(float wheel_speed) const;
+    float vehicle_speed_to_wheel_speed(float vehicle_speed) const;
     float get_safe_distance(const std::vector<float>& ranges, size_t center_index,
                               size_t check_width, float safety_level) const;
     size_t find_target_index(const std::vector<float>& ranges, size_t check_width,
@@ -82,60 +93,55 @@ class ReactiveGapFollow : public rclcpp::Node
         const std_msgs::msg::Header& header, float steering_angle,
         float target_distance, float collision_distance,
         const PathGuidance& path_guidance, float current_steering_angle,
-        float prediction_speed, float collision_ttc, float braking_distance,
-        bool emergency, bool braking_for_risk);
+        float prediction_speed, float commanded_speed,
+        float collision_ttc, float braking_distance,
+        float turning_speed_cap, float trajectory_speed_cap,
+        bool emergency, bool braking_for_risk,
+        bool preview_tracking_active, bool steering_avoidance_active,
+        int steering_avoidance_direction);
 
     float set_speed_from_distance(
-        float distance, float steering_angle, float actual_speed);
+        float distance, float steering_angle, float vehicle_speed);
     float get_speed_increase_ratio(float distance) const;
     float limit_speed_change(
         float desired_speed, float distance, float steering_angle, bool emergency,
+        float minimum_command_speed, float maximum_command_speed,
         uint64_t current_time, float& acceleration);
     float smooth_steering(float new_value);
 
     std::deque<float> steering_window;
     float steering_sum = 0.0;
-    float current_speed = 0.0;
+    // All speeds inside the planner are calibrated physical m/s. Conversion to
+    // the uncalibrated wheel-controller unit happens only at the ROS boundary.
+    float current_vehicle_speed = 0.0F;
     uint64_t last_update_time = 0;
 
-    // Keep a committed obstacle-avoidance side long enough for the vehicle's
-    // steering actuator to follow it. Release thresholds are derived from the
-    // common candidate clearance and direction hold time.
-    int avoidance_direction = 0;
-    int64_t avoidance_direction_start_time = 0;
-    int64_t avoidance_clear_start_time = 0;
-    // Preserve the approach speed for a safe avoidance episode. Recovery is
-    // enabled only after the selected trajectory stays safe for one steering
-    // transition, and remains subject to all normal speed ceilings.
-    float avoidance_entry_speed = 0.0F;
-    int64_t avoidance_speed_safe_start_time = 0;
-    // An obstacle episode may correct its initially chosen side once, but it
-    // must not bounce back and forth as individual scan candidates flicker.
-    bool avoidance_direction_switched = false;
-    int pending_avoidance_direction = 0;
-    int64_t pending_avoidance_direction_start_time = 0;
-    bool avoidance_obstacle_locked = false;
-    double avoidance_obstacle_global_x = 0.0;
-    double avoidance_obstacle_global_y = 0.0;
-
     std::vector<PathPoint> reference_path;
+    float reference_path_max_speed = std::numeric_limits<float>::infinity();
     std::string reference_path_frame;
     bool path_locked = false;
     nav_msgs::msg::Odometry latest_localization;
     rclcpp::Time latest_localization_receive_time{0, 0, RCL_ROS_TIME};
     bool has_localization = false;
-    float filtered_odom_speed = 0.0F;
-    std::deque<float> odom_speed_window;
+    rclcpp::Time latest_speed_odometry_receive_time{0, 0, RCL_ROS_TIME};
+    bool has_speed_odometry = false;
+    float filtered_vehicle_speed = 0.0F;
 
     float latest_steering_feedback = 0.0F;
-    float latest_speed_feedback = 0.0F;
+    float latest_vehicle_speed_feedback = 0.0F;
     float last_published_steering = 0.0F;
+    // /ackermann_cmd is the most recent actuator command, not a measured wheel
+    // angle. Keep an internal actuator-state estimate so trajectory prediction
+    // starts from the steering the vehicle can physically have reached.
+    float estimated_current_steering = 0.0F;
+    int64_t estimated_steering_update_time = 0;
     rclcpp::Time latest_steering_feedback_receive_time{0, 0, RCL_ROS_TIME};
     bool has_steering_feedback = false;
 
     rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_publisher;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_subscriber;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr localization_subscriber;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr speed_odometry_subscriber;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_path_subscriber;
     rclcpp::Subscription<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr
         steering_feedback_subscriber;

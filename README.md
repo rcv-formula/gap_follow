@@ -1,6 +1,6 @@
 # Reactive Gap Follow Ver2
 
-LiDAR로 주행 가능한 공간을 찾고 Ackermann 조향·속도 명령을 생성하는 ROS 2 패키지입니다. `/odom` localization과 최초 `/global_path`를 받아, 좌우 gap이 모두 안전할 때 path 방향의 gap을 우선합니다. path가 아직 없거나 localization이 오래되면 기존 LiDAR-only gap follower로 자동 복귀합니다.
+LiDAR로 주행 가능한 공간을 찾고 Ackermann 조향·속도 명령을 생성하는 ROS 2 패키지입니다. `/odom` localization과 최초 `/global_path`를 받아, 좌우 gap이 모두 안전할 때 path 방향의 gap을 우선합니다. `/odom_wheel`의 미보정 속도에는 `speed_calibration_factor`를 적용하고, 보정된 실제 m/s 하나를 TTC·제동거리·속도별 회전반경 계산에 공통 사용합니다. path가 아직 없거나 localization이 오래되면 기존 LiDAR-only gap follower로 자동 복귀합니다.
 
 이 구현은 기본 Follow-the-Gap에 다음 기능을 추가합니다.
 
@@ -82,7 +82,7 @@ score = (1 - gap_width_preference) * capped_safe_distance
 
 ### 4. Reference path 조향 preference
 
-`/odom`의 현재 위치·yaw와 최초로 수신한 `/global_path`로부터 `path_lookahead_distance` 앞의 목표점을 구합니다. 이 목표 방향은 속도 계산에는 사용하지 않으며 gap 후보의 조향 preference에만 사용합니다.
+`/odom`의 현재 위치·yaw와 최초로 수신한 `/global_path`로부터 `path_lookahead_distance` 앞의 목표점을 구합니다. 목표점의 x/y 방향은 안전한 gap 후보의 조향 preference에, z 속도는 `path_speed_scale`을 곱한 CLEAR 목표속도에 사용합니다.
 
 path 가산점은 다음 LiDAR 안전조건을 모두 만족한 후보에만 적용됩니다.
 
@@ -95,7 +95,7 @@ path 가산점은 다음 LiDAR 안전조건을 모두 만족한 후보에만 적
 
 ### 5. 조향 궤적 충돌검사
 
-최신 `/ackermann_cmd` 조향에서 새 목표 조향까지 `steering_transition_time` 동안 점진적으로 변하는 Ackermann 궤적을 `trajectory_check_step` 간격으로 검사합니다. 조향 피드백이 오래됐으면 직전 gap follower 명령을 시작 조향으로 사용합니다. 각 예측 pose에서 LiDAR 포인트를 차량 좌표로 변환하고, 다음 직사각형 안에 들어오면 충돌로 판단합니다.
+`/ackermann_cmd`는 실제 바퀴각이 아니라 최신 actuator 명령입니다. 노드는 이 명령을 `steering_transition_time`의 응답 모델로 적분해 현재 실제 조향각을 추정하고, 그 추정값에서 새 목표 조향까지 다시 점진적으로 변하는 Ackermann 궤적을 `trajectory_check_step` 간격으로 검사합니다. 피드백 명령이 오래됐으면 직전 gap follower 명령을 actuator 목표로 사용합니다. 각 예측 pose에서 LiDAR 포인트를 차량 좌표로 변환하고, 다음 직사각형 안에 들어오면 충돌로 판단합니다.
 
 ```text
 half_length = vehicle_length / 2 + trajectory_safety_margin
@@ -106,38 +106,47 @@ half_width  = vehicle_width / 2 + trajectory_safety_margin
 
 ```text
 ideal_curvature = tan(steering) / wheel_base
-curvature_gain(v) = clamp(
-    1 / (curvature_model_offset + curvature_model_speed_squared_gain * v²),
+curvature_gain(v_actual) = clamp(
+    1 / (curvature_model_offset + curvature_model_speed_squared_gain * v_actual²),
     curvature_gain_min,
     curvature_gain_max)
 modeled_curvature = ideal_curvature × curvature_gain(v)
 ```
 
-속도 bin별 실측 gain 중앙값은 약 `1.22 (0.35~0.6 m/s)`, `0.98 (0.6~0.9)`, `0.65 (0.9~1.2)`, `0.64 (1.2~1.5, 표본 3개)`였습니다. 1.2 m/s를 넘는 안정 코너 표본이 부족하므로 고속 외삽은 `curvature_gain_min: 0.60`에서 제한합니다. 이 모델은 충돌검사 궤적, RViz footprint 궤적, 마찰 기반 코너 속도 상한에 공통 사용됩니다.
+원래 raw wheel 속도로 fitting한 `speed_squared_gain: 0.59`는 실제 속도 입력에 맞춰 `0.59 / 2.6² = 0.0873`으로 환산했습니다. 따라서 모델의 회전반경은 바뀌지 않고 속도 단위만 실제 m/s로 통일됩니다. 기존 속도 bin `0.35~0.6 / 0.6~0.9 / 0.9~1.2 m/s(raw)`는 실제 속도로 `0.91~1.56 / 1.56~2.34 / 2.34~3.12 m/s`입니다. 고속 외삽은 `curvature_gain_min: 0.60`에서 제한합니다.
 
 같은 30° 조향에서 모델이 사용하는 대표 회전반경은 다음과 같습니다.
 
 | 속도 | 곡률 이득 | 예측 회전반경 |
 |---:|---:|---:|
-| `0.50 m/s` | `1.17` | `0.48 m` |
-| `0.75 m/s` | `0.96` | `0.58 m` |
-| `1.00 m/s` | `0.77` | `0.73 m` |
-| `1.20 m/s` | `0.64` | `0.88 m` |
-| `1.50 m/s 이상` | `0.60` | `0.94 m` |
+| `1.30 m/s` | `1.17` | `0.48 m` |
+| `1.95 m/s` | `0.96` | `0.58 m` |
+| `2.60 m/s` | `0.77` | `0.73 m` |
+| `3.12 m/s` | `0.64` | `0.88 m` |
+| `3.90 m/s 이상` | `0.60` | `0.94 m` |
 
-선택한 궤적에서 검사 horizon 안의 충돌점이 하나라도 발견되면 즉시 전체 조향 범위를 다시 검사합니다. `candidate_safety_level`로 계산한 `guard_clearance`가 공통 `candidate_min_clearance` 이상이고, 직사각형 전환 궤적이 horizon 끝까지 완전히 충돌 없는 조향만 회피 후보가 됩니다. 통과한 안전 후보들의 LiDAR clearance·조향 변화 점수에 path alignment 가산점을 더하므로 양쪽 회피가 모두 안전하면 path에 가까운 쪽을 우선합니다. 모든 조향에 충돌점이 있을 때만 속도 상한을 계산합니다.
+선택한 궤적에서 검사 horizon 안의 충돌점이 하나라도 발견되면 즉시 전체 조향 범위를 다시 검사합니다. 장애물 포인트는 `obstacle_detection_distance` 전체에서 유지하지만, 회피 후보는 차량 몸체가 장애물 옆을 빠져나갈 수 있는 maneuver horizon까지만 같은 조향으로 검사합니다. 3 m 끝까지 같은 방향으로 계속 돌아가다 벽에 닿는 가상 궤적 때문에 실제로 가능한 회피까지 버리지 않으며, 이후 구간은 다음 scan에서 다시 계획합니다. `candidate_safety_level`로 계산한 `guard_clearance`가 공통 `candidate_min_clearance` 이상이고 이 maneuver horizon이 완전히 충돌 없는 조향만 회피 후보가 됩니다. 통과한 안전 후보들의 LiDAR clearance·조향 변화 점수에 path alignment 가산점을 더하므로 양쪽 회피가 모두 안전하면 path에 가까운 쪽을 우선합니다. 최종 조향을 고른 뒤에는 `/global_path.z` 목표속도로 같은 전환 궤적을 다시 검사하고, 위험하면 같은 조향이 안전해지는 최대 속도를 탐색합니다.
 
 장애물을 피해 한쪽 조향을 선택하면 회피를 유발한 LiDAR 충돌점을 `/odom` 좌표에 고정하고 같은 방향을 유지합니다. 정면 궤적뿐 아니라 global path 궤적이 막히고 안전한 detour가 선택된 경우에도 즉시 latch하므로, 장애물이 가까워지기 전에 일반 gap 선택이 좌우로 번갈아 바뀌는 현상을 막습니다. 옆으로 비켜서 현재 정면에서 장애물이 사라져도 latch를 풀지 않으며, 저장한 장애물이 차량 뒤쪽으로 차체 반 길이와 장애물 깊이 여유만큼 완전히 지나간 뒤에만 안전한 path 복귀를 허용합니다.
 
 고정된 쪽이 위험해지면 반대쪽 궤적이 완전히 충돌 없고 `steering_transition_time` 동안 연속으로 안전할 때만 방향을 바꿉니다. 기존 방향의 TTC가 이 시간 이하인 비상상황에서는 안전한 반대편으로 즉시 전환합니다. 같은 장애물을 지나는 동안 이러한 보정 전환은 한 번만 허용하며, 이후 양쪽 모두 위험해지면 기존 조향 부호를 유지한 채 BRAKE/STOP으로 감속합니다. 마지막 독립 안전검사도 동일한 latch 규칙을 사용하므로 방향 고정을 우회하지 않습니다.
 
-최소 유지시간이 지나도 저장한 장애물을 아직 완전히 통과하지 않았으면 path 방향으로 조기 복귀하지 않습니다. 장애물을 통과했고 global path 방향의 직사각형 전환 궤적도 안전할 때만 복귀합니다.
+일반적으로 저장한 장애물을 완전히 통과하고 global path 방향의 직사각형 전환 궤적도 안전할 때 복귀합니다. 단, 기존 회피 방향의 TTC가 짧아 안전한 반대쪽으로 긴급 보정한 경우에는 그 보정 방향을 또 뒤집는 대신, global path 복귀 전환 궤적이 `steering_transition_time` 동안 연속으로 안전하면 별도의 종료 기동으로 조기에 복귀합니다. 따라서 오른쪽으로 급히 피한 뒤 안전한 왼쪽 path 복귀가 확인되면 S자 형태의 반대 조향을 허용합니다.
 
 ### 6. 속도 제어
 
-기본 목표 속도는 안전거리에 `speed_factor`를 곱해 계산하며, 먼 공간에서는 `speed_increase_factor`만큼 점진적으로 증가합니다. 조향이 클 때는 마찰계수와 실측 속도별 곡률로 계산한 선회 속도 한계를 적용합니다. 회피 방향을 latch했거나 안전한 대체 조향을 사용 중이고, 동적 제동 horizon 전체의 직사각형 전환 궤적이 충돌 없이 안전하면 장애물 옆 LiDAR 거리만으로 추가 감속하지 않습니다. latch가 시작될 때 실제 odom 속도와 명령 속도 중 큰 값을 회피 진입 속도로 저장하고, 그 진입 속도로 늘어난 제동 horizon의 궤적까지 `steering_transition_time` 동안 연속으로 안전하면 해당 속도까지 점진적으로 유지·복원합니다. 선회 속도, `narrow_gap_max_speed`, `max_speed` 상한은 계속 적용하며 BRAKE/STOP이 발생하면 복원을 즉시 중단합니다.
+모든 속도·가속도 파라미터와 내부 계산은 실제 `m/s`, `m/s²` 단위입니다. 현재 타이어/encoder가 미보정 상태이므로 경계에서만 다음 변환을 적용합니다.
 
-제동거리는 `steering_transition_time`, `/odom` 속도, `normal_deceleration`, `trajectory_safety_margin`으로 계산합니다. 전환 궤적이 horizon 끝까지 안전한 조향이 하나라도 있으면 감속하지 않습니다. 모든 조향이 위험하면 충돌거리에서 `normal_deceleration`으로 정지 가능한 속도를 즉시 역산하여 완만하게 감속하고, TTC가 `steering_transition_time`보다 짧아진 실제 비상상황에서만 `max_deceleration`으로 `minimum_crawl_speed`를 향해 감속합니다.
+```text
+actual_vehicle_speed = odom_wheel.linear.x × 2.6
+drive_gf2.speed       = desired_actual_speed ÷ 2.6
+```
+
+test_29의 `/odom` 위치 변화량과 `/odom_wheel.linear.x`를 비교하면 0.1~0.3초 구간의 중앙 비율이 `2.57~2.59`여서 기본 보정값을 `2.6`으로 사용합니다. `/odom`의 twist는 속도 제어에 사용하지 않고 localization pose만 사용합니다. 기존 주행 속도를 바꾸지 않도록 예전 wheel 단위 속도·가감속 파라미터도 모두 `×2.6`하여 실제 SI 단위로 마이그레이션했습니다. 따라서 같은 안전 상태에서 `/drive_gf2`에 나가는 wheel 명령값은 이전과 같습니다.
+
+기본 목표 속도는 안전거리에 `speed_factor`를 곱해 계산하고 path 속도가 있으면 `/global_path.z × path_speed_scale`을 목표로 사용합니다. 현재 `path_speed_scale: 0.70`이므로 원본 속도 프로파일을 30% 낮춥니다. 그 뒤 마찰계수와 실제 속도별 곡률로 계산한 선회 속도 한계를 항상 적용하므로 path 속도가 회전반경 제한을 덮어쓸 수 없습니다. 목표속도의 전환 궤적이 위험하면 crawl부터 목표속도 사이를 탐색해 충돌 없는 최대 속도를 구합니다. 선회·궤적·제동 상한은 최종 명령의 절대 상한이며 일반 감속 limiter가 이를 초과할 수 없습니다. 조향만으로 목표속도 궤적이 안전하면 장애물 거리만으로 감속하지 않습니다.
+
+제동거리는 `steering_transition_time`, 보정된 실제 차량속도, `normal_deceleration`, `trajectory_safety_margin`으로 계산합니다. 전환 궤적이 horizon 끝까지 안전한 조향이 하나라도 있으면 감속하지 않습니다. 모든 조향이 위험하면 충돌거리에서 `normal_deceleration`으로 정지 가능한 속도를 즉시 역산하여 완만하게 감속하고, TTC가 `steering_transition_time`보다 짧아진 실제 비상상황에서만 `max_deceleration`으로 `minimum_crawl_speed`를 향해 감속합니다. wheel odometry가 `odom_timeout`보다 오래되면 최근 명령을 실제 m/s로 환산한 값을 안전한 fallback으로 사용합니다.
 
 ## ROS 인터페이스
 
@@ -147,8 +156,9 @@ launch 실행 시 노드 전체 이름은 `/gap_follow_ver2/gap_follow_ver2`입�
 |---|---|---|---|
 | Subscribe | `/scan` | `sensor_msgs/msg/LaserScan` | 전방 장애물 및 gap 계산 입력 |
 | Subscribe | `/odom` | `nav_msgs/msg/Odometry` | path preference용 localization 입력 |
+| Subscribe | `/odom_wheel` | `nav_msgs/msg/Odometry` | 보정 전 wheel 속도 입력. `× speed_calibration_factor` 후 사용 |
 | Subscribe | `/global_path` | `nav_msgs/msg/Path` | 최초 메시지만 고정 사용하는 reference path |
-| Publish | `/drive_gf2` | `ackermann_msgs/msg/AckermannDriveStamped` | 조향각, 속도, 가속도 명령 |
+| Publish | `/drive_gf2` | `ackermann_msgs/msg/AckermannDriveStamped` | 조향각과 미보정 wheel controller 단위의 속도·가속도 명령 |
 | Publish | `/gap_follow_ver2/target_waypoint` | `geometry_msgs/msg/PointStamped` | 선택한 로컬 목표점, `debug: true`일 때 발행 |
 | Publish | `/gap_follow_ver2/debug_markers` | `visualization_msgs/msg/MarkerArray` | 목표 방향, 예상 궤적, footprint, 상태 표시 |
 
@@ -205,6 +215,11 @@ RViz에는 다음 display를 추가합니다.
 | `MarkerArray` | `/gap_follow_ver2/debug_markers` | 목표 방향과 충돌검사 궤적 확인 |
 | `PointStamped` | `/gap_follow_ver2/target_waypoint` | 선택 목표점 확인 |
 
+디버그 텍스트의 `CLEAR/BRAKE/STOP`은 속도·충돌 위험 상태이고,
+`steer_state=FOLLOW/AVOID_LEFT/AVOID_RIGHT`는 조향 상태입니다. 충돌 없는
+회피 조향은 `CLEAR steer_state=AVOID_*`와 청록색 궤적으로 표시되며,
+회피하면서 감속하는 경우에는 `BRAKE` 또는 `STOP`과 회피 방향이 함께 표시됩니다.
+
 `Fixed Frame`은 bag의 `/scan` 메시지에 기록된 frame을 사용합니다. 일반적으로 `base_link` 또는 LiDAR frame입니다. 마커가 보이지 않으면 `debug: true`, 토픽 이름, Fixed Frame과 TF 연결을 확인합니다.
 
 ## 파라미터
@@ -224,14 +239,17 @@ RViz에는 다음 display를 추가합니다.
 |---|---:|---|
 | `enable_path_guidance` | `true` | global path와 localization이 유효할 때 path 조향 preference 활성화 |
 | `localization_topic` | `/odom` | `Odometry` localization 토픽 |
-| `odom_timeout` | `0.3` s | path pose와 TTC 속도에 공통 적용하는 odom 유효시간 |
+| `speed_odometry_topic` | `/odom_wheel` | 보정 전 wheel 속도용 odometry 토픽 |
+| `speed_calibration_factor` | `2.6` | `실제 m/s = wheel/controller 속도 × 2.6` 변환값 |
+| `odom_timeout` | `0.3` s | localization pose와 wheel odometry에 공통 적용하는 유효시간 |
 | `global_path_topic` | `/global_path` | `nav_msgs/msg/Path` 입력 토픽 |
+| `path_speed_scale` | `0.70` | `/global_path`의 z 속도 프로파일에 곱하는 전체 배율 |
 | `global_path_transient_local` | `true` | latched path 수신용 transient-local QoS |
 | `path_is_closed` | `true` | 폐곡선 트랙 여부 |
 | `path_lookahead_distance` | `1.2` m | path 진행방향의 조향 목표 거리 |
 | `path_guidance_weight` | `0.6` | 평상시 안전 gap 사이의 path preference |
-| `path_rejoin_weight` | `2.0` | path 이탈 시 안전 gap 및 안전 회피 후보 사이의 복귀 preference |
-| `path_rejoin_distance` | `0.5` m | 복귀 preference 적용 시작 거리 |
+| `path_rejoin_weight` | `2.4` | path 이탈 시 안전 gap 및 안전 회피 후보 사이의 복귀 preference |
+| `path_rejoin_distance` | `0.3` m | 복귀 preference 적용 시작 거리 |
 | `path_candidate_min_score_ratio` | `0.85` | LiDAR-only 최적 gap 대비 최소 기본점수 비율 |
 | `path_alignment_sigma` | `35.0` deg | path 방향 preference의 각도 폭 |
 | `path_max_guidance_angle` | `85.0` deg | 이보다 뒤쪽인 path 목표는 무시 |
@@ -243,18 +261,18 @@ RViz에는 다음 display를 추가합니다.
 |---|---:|---|
 | `max_steering_angle` | `45.0` deg | 명령 및 충돌검사에 사용하는 최대 조향각 |
 | `steering_smooth_window` | `3` | 최근 조향 명령 평균 개수 |
-| `speed_factor` | `0.24` | 안전거리에서 기본 속도로 변환하는 계수 |
-| `max_speed` | `3.0` m/s | 최대 속도 |
-| `narrow_gap_max_speed` | `1.5` m/s | 기본 차량 반폭만으로 재탐색한 좁은 gap의 속도 제한 |
-| `minimum_non_emergency_speed` | `1.0` m/s | 비상 충돌 궤적이 아닐 때 유지하는 일반 최저 속도 |
-| `minimum_crawl_speed` | `0.3` m/s | 실제 비상 충돌 궤적에서 유지하는 crawl 속도 |
+| `speed_factor` | `0.78` | 안전거리에서 실제 목표속도로 변환하는 계수 |
+| `max_speed` | `9.1` m/s | 기존 wheel 상한 `3.5 × 2.6`을 SI 단위로 옮긴 값 |
+| `narrow_gap_max_speed` | `5.2` m/s | 기존 wheel 상한 `2.0 × 2.6`을 SI 단위로 옮긴 값 |
+| `minimum_non_emergency_speed` | `2.6` m/s | 기존 wheel 최저속도 `1.0 × 2.6`을 옮긴 값 |
+| `minimum_crawl_speed` | `0.78` m/s | 기존 wheel crawl `0.3 × 2.6`을 옮긴 값 |
 | `speed_increase_start` | `3.0` m | 추가 속도 배율이 시작되는 안전거리 |
 | `speed_increase_end` | `15.0` m | 추가 속도 배율이 최대가 되는 안전거리 |
 | `speed_increase_factor` | `1.5` | 먼 공간에서 적용할 최대 속도 배율 |
-| `min_acceleration` | `0.5` m/s² | 가까운 구간의 가속도 제한 |
-| `max_acceleration` | `6.0` m/s² | 열린 구간의 최대 가속도 제한 |
-| `normal_deceleration` | `3.0` m/s² | 회피 불가능 장애물에 미리 대응하는 평상시 감속도 |
-| `max_deceleration` | `6.0` m/s² | TTC 비상상황에만 사용하는 최대 감속도 |
+| `min_acceleration` | `1.3` m/s² | 기존 wheel 가속도 `0.5 × 2.6`을 옮긴 값 |
+| `max_acceleration` | `5.2` m/s² | 짧은 CLEAR 구간에서 path 속도로 과가속하지 않도록 제한한 평상시 가속 상한 |
+| `normal_deceleration` | `7.8` m/s² | 기존 wheel 감속도 `3.0 × 2.6`을 옮긴 값 |
+| `max_deceleration` | `15.6` m/s² | 기존 wheel 비상 감속도 `6.0 × 2.6`을 옮긴 값 |
 
 ### 차량 형상 및 gap 안전 기준
 
@@ -263,17 +281,17 @@ RViz에는 다음 display를 추가합니다.
 | `friction` | `0.75` | 선회 속도 계산에 사용하는 마찰계수 |
 | `wheel_base` | `0.324` m | Ackermann wheelbase |
 | `curvature_model_offset` | `0.71` | 실측 곡률 이득 모델의 상수항 |
-| `curvature_model_speed_squared_gain` | `0.59` | 속도 증가에 따른 실제 곡률 감소 계수 |
+| `curvature_model_speed_squared_gain` | `0.0873` | 실제 m/s 증가에 따른 곡률 감소 계수 (`0.59 / 2.6²`) |
 | `curvature_gain_min` | `0.60` | 표본 부족 고속 구간의 최소 곡률 이득 |
 | `curvature_gain_max` | `1.25` | 저속 구간의 최대 곡률 이득 |
-| `vehicle_width` | `0.30` m | base_link 중심 직사각형 차량 폭 |
+| `vehicle_width` | `0.36` m | base_link 중심 직사각형 차량 폭 |
 | `vehicle_length` | `0.55` m | base_link 중심 직사각형 차량 길이 |
 | `lidar_offset_x` | `0.27` m | `base_link` 기준 LiDAR x 위치 |
 | `lidar_offset_y` | `0.0` m | `base_link` 기준 LiDAR y 위치 |
-| `gap_safety_margin` | `0.1` m | 선호 gap을 만들 때 차량 반폭에 추가하는 벽 여유 |
+| `gap_safety_margin` | `0.3` m | 선호 gap을 만들 때 차량 반폭에 추가하는 벽 여유 |
 | `gap_fallback_distance` | `0.4` m | 선호 gap이 부족할 때 기본 반폭 scan으로 재탐색하는 기준 |
-| `path_check_angle` | `30.0` deg | 후보 주변 안전거리 검사 반각이자 애매한 분기의 조향 제한 |
-| `safety_level` | `0.8` | gap 점수와 속도에 사용할 주변 거리 분포 위치 |
+| `path_check_angle` | `45.0` deg | 후보 주변 안전거리 검사 반각이자 애매한 분기의 조향 제한 |
+| `safety_level` | `0.7` | gap 점수와 속도에 사용할 주변 거리 분포 위치 |
 | `candidate_safety_level` | `0.4` | path 및 회피 후보의 안전 통과 여부에 사용할 분포 위치 |
 | `candidate_min_clearance` | `0.5` m | path 및 회피 후보에 공통 적용할 최소 안전거리 |
 
@@ -284,11 +302,12 @@ RViz에는 다음 display를 추가합니다.
 | `obstacle_edge_threshold` | `0.15` m | 장애물 경계로 판단할 인접 ray 거리 차이 |
 | `scan_filter_window` | `5` | 중앙값 필터 창 크기 |
 | `max_scan_angle` | `90.0` deg | 전방 기준 한쪽 시야각. 실제 사용 범위는 ±90도 |
-| `avoidance_steering_step` | `2.0` deg | 대체 조향 탐색 간격 |
+| `avoidance_steering_step` | `1.0` deg | 대체 조향 탐색 간격 |
 | `avoidance_steering_change_penalty` | `0.3` | 기존 gap 목표에서 크게 벗어나는 조향 억제값 |
 | `avoidance_direction_hold_time` | `0.4` s | 선택한 회피 방향을 최소 유지하는 시간. 전방 장애물이 남아 있으면 이후에도 유지 |
 | `avoidance_direction_min_angle` | `10.0` deg | 회피 방향 고정을 시작하고 유지할 최소 조향각 |
-| `trajectory_check_distance` | `1.0` m | 현재 조향 궤적을 검사할 거리 |
+| `obstacle_detection_distance` | `3.0` m | 충돌판단에 유지할 LiDAR 장애물·벽 포인트의 전방 탐지 범위 |
+| `trajectory_check_distance` | `1.5` m | 전환 궤적 검사의 기본 거리. 고속에서는 `속도 × 0.2초 + 차량 앞부분`까지 자동 확장 |
 | `trajectory_check_step` | `0.05` m | 궤적 샘플 간격 |
 | `trajectory_safety_margin` | `0.05` m | 직사각형 전후·좌우와 제동거리에 공통 적용하는 여유 |
 | `steering_feedback_topic` | `/ackermann_cmd` | 전환 궤적의 시작 조향으로 사용할 최종 명령 |

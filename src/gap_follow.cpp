@@ -1,5 +1,6 @@
 #include "gap_follow.hpp"
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -13,6 +14,115 @@ std::string normalized_frame(std::string frame)
         frame.erase(frame.begin());
     }
     return frame;
+}
+
+// Robust command-to-curvature surface fitted from all seven available
+// test_13--test_29 real-car bags.  The steering value is the Ackermann command
+// seen by the servo bridge, not a measured tire angle, so a bicycle tan() model
+// substantially over-predicts the turn at 4--6 m/s.  Keep this calibration in
+// one place and interpolate it for collision prediction and turn-speed limits.
+constexpr std::array<float, 9> kCurvatureCalibrationSpeeds = {
+    1.75F, 2.25F, 2.75F, 3.25F, 3.75F,
+    4.25F, 4.75F, 5.25F, 5.75F};
+constexpr std::array<float, 8> kCurvatureCalibrationCommandsDeg = {
+    0.0F, 7.5F, 12.5F, 17.5F, 22.5F, 27.5F, 35.0F, 38.57F};
+constexpr std::array<std::array<float, 8>, 9> kMedianCurvature = {{
+    {{0.0F, 0.2483F, 0.4413F, 0.5555F, 0.6484F, 0.8070F, 0.9473F, 1.0000F}},
+    {{0.0F, 0.2613F, 0.3865F, 0.4551F, 0.5812F, 0.6607F, 0.7588F, 0.8244F}},
+    {{0.0F, 0.2153F, 0.3182F, 0.3869F, 0.4953F, 0.5303F, 0.6432F, 0.6665F}},
+    {{0.0F, 0.2035F, 0.2377F, 0.3231F, 0.3698F, 0.4130F, 0.4491F, 0.4928F}},
+    {{0.0F, 0.1682F, 0.2194F, 0.2398F, 0.2900F, 0.3754F, 0.3904F, 0.4373F}},
+    {{0.0F, 0.1281F, 0.1334F, 0.1620F, 0.2524F, 0.2904F, 0.3058F, 0.3856F}},
+    {{0.0F, 0.0938F, 0.1027F, 0.1339F, 0.1971F, 0.2374F, 0.2374F, 0.2374F}},
+    {{0.0F, 0.0967F, 0.1074F, 0.1249F, 0.1660F, 0.1674F, 0.1674F, 0.1954F}},
+    {{0.0F, 0.0928F, 0.1037F, 0.1216F, 0.1327F, 0.1414F, 0.1414F, 0.1414F}},
+}};
+constexpr float kPositiveCurvatureScale = 1.115F;
+constexpr float kNegativeCurvatureScale = 0.841F;
+
+template <size_t N>
+std::pair<size_t, float> interpolation_bracket(
+    const std::array<float, N>& values, float query)
+{
+    if (query <= values.front())
+    {
+        return {0, 0.0F};
+    }
+    if (query >= values.back())
+    {
+        return {N - 2, 1.0F};
+    }
+    for (size_t i = 0; i + 1 < N; ++i)
+    {
+        if (query <= values[i + 1])
+        {
+            return {
+                i,
+                (query - values[i]) / (values[i + 1] - values[i])};
+        }
+    }
+    return {N - 2, 1.0F};
+}
+
+float interpolate(float lower, float upper, float ratio)
+{
+    return lower + ratio * (upper - lower);
+}
+
+float calibrated_friction_coefficient(float low_speed_friction, float speed)
+{
+    constexpr float transition_start = 3.5F;
+    constexpr float transition_end = 4.5F;
+    constexpr float high_speed_ratio = 0.837F;
+    const float checked_friction = std::max(0.0F, low_speed_friction);
+    const float checked_speed = std::abs(speed);
+    if (checked_speed <= transition_start)
+    {
+        return checked_friction;
+    }
+    if (checked_speed >= transition_end)
+    {
+        return checked_friction * high_speed_ratio;
+    }
+    const float ratio
+        = (checked_speed - transition_start) / (transition_end - transition_start);
+    const float smooth_ratio = ratio * ratio * ratio
+        * (ratio * (ratio * 6.0F - 15.0F) + 10.0F);
+    return interpolate(
+        checked_friction,
+        checked_friction * high_speed_ratio,
+        smooth_ratio);
+}
+
+float modeled_steering_during_transition(
+    float current_steering,
+    float target_steering,
+    float elapsed_time,
+    float configured_response_time,
+    float maximum_steering)
+{
+    const float response_time = std::max(1.0e-3F, configured_response_time);
+    // Seven-bag actuator fit used by the simulator: about 0.02 s transport
+    // delay and 0.14 s first-order response for a 0.20 s configured response.
+    // Deriving the constants from the existing single parameter avoids adding
+    // another group of tuning knobs.
+    const float transport_delay = 0.10F * response_time;
+    const float time_constant = std::max(1.0e-3F, 0.70F * response_time);
+    if (elapsed_time <= transport_delay)
+    {
+        return current_steering;
+    }
+    const float response_elapsed = elapsed_time - transport_delay;
+    const float first_order_ratio
+        = 1.0F - std::exp(-response_elapsed / time_constant);
+    const float first_order_delta
+        = first_order_ratio * (target_steering - current_steering);
+    const float steering_rate_limit = std::max(
+        1.0e-3F, maximum_steering / time_constant);
+    const float maximum_delta = steering_rate_limit * response_elapsed;
+    const float limited_delta = std::max(
+        -maximum_delta, std::min(first_order_delta, maximum_delta));
+    return current_steering + limited_delta;
 }
 }  // namespace
 
@@ -54,6 +164,20 @@ ReactiveGapFollow::ReactiveGapFollow():
             {
                 this->localization_callback(msg);
             });
+
+    const std::string speed_odometry_topic
+        = this->get_parameter("speed_odometry_topic").as_string();
+    if (!speed_odometry_topic.empty())
+    {
+        speed_odometry_subscriber
+            = this->create_subscription<nav_msgs::msg::Odometry>(
+                speed_odometry_topic,
+                qos,
+                [this](const nav_msgs::msg::Odometry::SharedPtr msg)
+                {
+                    this->speed_odometry_callback(msg);
+                });
+    }
 
     const std::string steering_feedback_topic
         = this->get_parameter("steering_feedback_topic").as_string();
@@ -135,6 +259,7 @@ void ReactiveGapFollow::global_path_callback(const nav_msgs::msg::Path::SharedPt
     {
         const double x = pose.pose.position.x;
         const double y = pose.pose.position.y;
+        const double speed = pose.pose.position.z;
         if (!std::isfinite(x) || !std::isfinite(y))
         {
             continue;
@@ -145,12 +270,20 @@ void ReactiveGapFollow::global_path_callback(const nav_msgs::msg::Path::SharedPt
             const double dy = y - received_path.back().y;
             if (dx * dx + dy * dy < 1.0e-8)
             {
+                if (std::isfinite(speed) && speed >= 0.0)
+                {
+                    received_path.back().speed = speed;
+                }
                 continue;
             }
         }
         PathPoint point;
         point.x = x;
         point.y = y;
+        if (std::isfinite(speed) && speed >= 0.0)
+        {
+            point.speed = speed;
+        }
         received_path.push_back(point);
     }
     if (received_path.size() < 2)
@@ -160,6 +293,24 @@ void ReactiveGapFollow::global_path_callback(const nav_msgs::msg::Path::SharedPt
     }
 
     reference_path = std::move(received_path);
+    const float path_speed_scale = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("path_speed_scale").as_double()));
+    reference_path_max_speed = -std::numeric_limits<float>::infinity();
+    for (const auto& point : reference_path)
+    {
+        if (std::isfinite(point.speed))
+        {
+            reference_path_max_speed = std::max(
+                reference_path_max_speed,
+                path_speed_scale * static_cast<float>(point.speed));
+        }
+    }
+    if (!std::isfinite(reference_path_max_speed))
+    {
+        reference_path_max_speed = std::numeric_limits<float>::infinity();
+    }
     reference_path_frame = normalized_frame(path_frame);
     path_locked = true;
     RCLCPP_INFO(
@@ -191,31 +342,32 @@ void ReactiveGapFollow::localization_callback(
 
     latest_localization = *msg;
     latest_localization_receive_time = this->now();
-    const float maximum_odom_speed = 1.25F * std::max(
+    has_localization = true;
+}
+
+void ReactiveGapFollow::speed_odometry_callback(
+    const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    if (!msg || !std::isfinite(msg->twist.twist.linear.x))
+    {
+        return;
+    }
+
+    const float maximum_vehicle_speed_measurement = 1.25F * std::max(
         0.1F,
         static_cast<float>(this->get_parameter("max_speed").as_double()));
-    const float raw_speed = std::min(
-        maximum_odom_speed,
-        static_cast<float>(std::abs(msg->twist.twist.linear.x)));
-    odom_speed_window.push_back(raw_speed);
-    const int scan_filter_window = std::max(
-        1, static_cast<int>(this->get_parameter("scan_filter_window").as_int()));
-    const size_t filter_window
-        = 2 * static_cast<size_t>(scan_filter_window) + 1;
-    while (odom_speed_window.size() > filter_window)
-    {
-        odom_speed_window.pop_front();
-    }
-    std::vector<float> sorted_speeds(
-        odom_speed_window.begin(), odom_speed_window.end());
-    const size_t median_index = sorted_speeds.size() / 2;
-    std::nth_element(
-        sorted_speeds.begin(),
-        sorted_speeds.begin() + median_index,
-        sorted_speeds.end());
-    const float median_speed = sorted_speeds[median_index];
-    filtered_odom_speed = median_speed;
-    has_localization = true;
+    const float vehicle_speed = std::min(
+        maximum_vehicle_speed_measurement,
+        this->wheel_speed_to_vehicle_speed(
+            static_cast<float>(std::abs(msg->twist.twist.linear.x))));
+    // This value drives TTC and the speed-dependent vehicle model. Reusing the
+    // 11-sample LiDAR median window here delayed fast acceleration by several
+    // m/s, so collision checks were performed at a speed the car had already
+    // exceeded. Odometry is already a state estimate; use its latest calibrated
+    // value and keep scan denoising confined to LaserScan data.
+    filtered_vehicle_speed = vehicle_speed;
+    latest_speed_odometry_receive_time = this->now();
+    has_speed_odometry = true;
 }
 
 void ReactiveGapFollow::steering_feedback_callback(
@@ -227,7 +379,8 @@ void ReactiveGapFollow::steering_feedback_callback(
         return;
     }
     latest_steering_feedback = msg->drive.steering_angle;
-    latest_speed_feedback = std::abs(msg->drive.speed);
+    latest_vehicle_speed_feedback = this->wheel_speed_to_vehicle_speed(
+        std::abs(msg->drive.speed));
     latest_steering_feedback_receive_time = this->now();
     has_steering_feedback = true;
 }
@@ -325,6 +478,11 @@ ReactiveGapFollow::PathGuidance ReactiveGapFollow::get_path_guidance()
         = reference_path[(nearest_segment + 1) % reference_path.size()];
     target.x = nearest_start.x + nearest_ratio * (nearest_end.x - nearest_start.x);
     target.y = nearest_start.y + nearest_ratio * (nearest_end.y - nearest_start.y);
+    if (std::isfinite(nearest_start.speed) && std::isfinite(nearest_end.speed))
+    {
+        target.speed = nearest_start.speed
+            + nearest_ratio * (nearest_end.speed - nearest_start.speed);
+    }
 
     double remaining = lookahead;
     size_t segment = nearest_segment;
@@ -342,6 +500,15 @@ ReactiveGapFollow::PathGuidance ReactiveGapFollow::get_path_guidance()
             const double target_ratio = ratio + remaining / segment_length;
             target.x = start.x + target_ratio * segment_x;
             target.y = start.y + target_ratio * segment_y;
+            if (std::isfinite(start.speed) && std::isfinite(end.speed))
+            {
+                target.speed = start.speed
+                    + target_ratio * (end.speed - start.speed);
+            }
+            else
+            {
+                target.speed = std::numeric_limits<double>::quiet_NaN();
+            }
             remaining = 0.0;
             break;
         }
@@ -360,6 +527,17 @@ ReactiveGapFollow::PathGuidance ReactiveGapFollow::get_path_guidance()
     guidance.target_angle = static_cast<float>(normalize_angle(global_target_angle - yaw));
     guidance.cross_track_error = static_cast<float>(std::sqrt(nearest_distance_squared));
     guidance.target = target;
+    guidance.available = true;
+    if (std::isfinite(target.speed) && target.speed >= 0.0)
+    {
+        const float path_speed_scale = std::max(
+            0.0F,
+            static_cast<float>(
+                this->get_parameter("path_speed_scale").as_double()));
+        guidance.target_speed
+            = path_speed_scale * static_cast<float>(target.speed);
+        guidance.speed_available = true;
+    }
 
     const double max_guidance_angle = std::max(
         0.0, this->get_parameter("path_max_guidance_angle").as_double())
@@ -533,7 +711,7 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
     const std::vector<std::pair<float, float>>& obstacle_points,
     float current_steering_angle,
     float target_steering_angle,
-    float speed,
+    float vehicle_speed,
     float check_distance) const
 {
     const float check_step = std::max(
@@ -552,11 +730,6 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
         static_cast<float>(this->get_parameter("vehicle_width").as_double()))
         + safety_margin;
 
-    if (this->get_parameter("wheel_base").as_double()
-        <= std::numeric_limits<float>::epsilon())
-    {
-        return TrajectoryRisk{0.0F, 0.0F};
-    }
     const float maximum_steering = static_cast<float>(
         this->get_parameter("max_steering_angle").as_double()
         * M_PI / 180.0);
@@ -568,12 +741,11 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
         this->get_parameter("lidar_offset_x").as_double());
     const float lidar_offset_y = static_cast<float>(
         this->get_parameter("lidar_offset_y").as_double());
-    const float prediction_speed = std::max(0.05F, std::abs(speed));
+    const float prediction_speed = std::max(0.05F, std::abs(vehicle_speed));
     const float transition_time = std::max(
         1.0e-3F,
         static_cast<float>(
             this->get_parameter("steering_transition_time").as_double()));
-
     TrajectoryRisk risk;
     float travelled = 0.0F;
     float vehicle_x = -lidar_offset_x;
@@ -610,12 +782,12 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
         const float distance_step = std::min(check_step, check_distance - travelled);
         const float midpoint_time
             = (travelled + 0.5F * distance_step) / prediction_speed;
-        const float transition_ratio = std::max(
-            0.0F, std::min(midpoint_time / transition_time, 1.0F));
-        const float smooth_ratio = transition_ratio * transition_ratio
-            * (3.0F - 2.0F * transition_ratio);
-        const float steering = checked_current_steering
-            + smooth_ratio * (checked_target_steering - checked_current_steering);
+        const float steering = modeled_steering_during_transition(
+            checked_current_steering,
+            checked_target_steering,
+            midpoint_time,
+            transition_time,
+            maximum_steering);
         const float curvature = this->get_modeled_curvature(
             steering, prediction_speed);
         const float midpoint_yaw = yaw + 0.5F * curvature * distance_step;
@@ -628,46 +800,83 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
     return risk;
 }
 
-float ReactiveGapFollow::get_curvature_gain(float speed) const
+float ReactiveGapFollow::get_speed_calibration_factor() const
 {
-    const float offset = std::max(
+    return std::max(
         1.0e-3F,
         static_cast<float>(
-            this->get_parameter("curvature_model_offset").as_double()));
-    const float speed_squared_gain = std::max(
-        0.0F,
-        static_cast<float>(
-            this->get_parameter("curvature_model_speed_squared_gain").as_double()));
-    const float minimum_gain = std::max(
-        1.0e-3F,
-        static_cast<float>(
-            this->get_parameter("curvature_gain_min").as_double()));
-    const float maximum_gain = std::max(
-        minimum_gain,
-        static_cast<float>(
-            this->get_parameter("curvature_gain_max").as_double()));
-    const float checked_speed = std::max(0.0F, std::abs(speed));
-    const float measured_gain = 1.0F
-        / (offset + speed_squared_gain * checked_speed * checked_speed);
-    return std::max(minimum_gain, std::min(measured_gain, maximum_gain));
+            this->get_parameter("speed_calibration_factor").as_double()));
+}
+
+float ReactiveGapFollow::wheel_speed_to_vehicle_speed(float wheel_speed) const
+{
+    return wheel_speed * this->get_speed_calibration_factor();
+}
+
+float ReactiveGapFollow::vehicle_speed_to_wheel_speed(float vehicle_speed) const
+{
+    return vehicle_speed / this->get_speed_calibration_factor();
 }
 
 float ReactiveGapFollow::get_modeled_curvature(
-    float steering_angle, float speed) const
+    float steering_angle, float vehicle_speed) const
 {
-    const float wheel_base = static_cast<float>(
-        this->get_parameter("wheel_base").as_double());
-    if (wheel_base <= std::numeric_limits<float>::epsilon())
-    {
-        return 0.0F;
-    }
     const float maximum_steering = static_cast<float>(
         this->get_parameter("max_steering_angle").as_double()
         * M_PI / 180.0);
     const float checked_steering = std::max(
         -maximum_steering, std::min(steering_angle, maximum_steering));
-    return this->get_curvature_gain(speed)
-        * std::tan(checked_steering) / wheel_base;
+    const float checked_speed = std::abs(vehicle_speed);
+    const float command_degrees = std::abs(
+        checked_steering * 180.0F / static_cast<float>(M_PI));
+    const auto speed_bracket = interpolation_bracket(
+        kCurvatureCalibrationSpeeds, checked_speed);
+    const auto command_bracket = interpolation_bracket(
+        kCurvatureCalibrationCommandsDeg, command_degrees);
+
+    const float lower_command_curvature = interpolate(
+        kMedianCurvature[speed_bracket.first][command_bracket.first],
+        kMedianCurvature[speed_bracket.first + 1][command_bracket.first],
+        speed_bracket.second);
+    const float upper_command_curvature = interpolate(
+        kMedianCurvature[speed_bracket.first][command_bracket.first + 1],
+        kMedianCurvature[speed_bracket.first + 1][command_bracket.first + 1],
+        speed_bracket.second);
+    const float magnitude = interpolate(
+        lower_command_curvature,
+        std::max(lower_command_curvature, upper_command_curvature),
+        command_bracket.second);
+    const float direction_scale = checked_steering >= 0.0F
+        ? kPositiveCurvatureScale : kNegativeCurvatureScale;
+    float modeled_curvature
+        = std::copysign(direction_scale * magnitude, checked_steering);
+    const float speed_squared = checked_speed * checked_speed;
+    if (speed_squared > 0.04F)
+    {
+        const float friction = calibrated_friction_coefficient(
+            static_cast<float>(this->get_parameter("friction").as_double()),
+            checked_speed);
+        const float curvature_limit = friction * 9.81F / speed_squared;
+        modeled_curvature = std::max(
+            -curvature_limit,
+            std::min(modeled_curvature, curvature_limit));
+    }
+    return modeled_curvature;
+}
+
+float ReactiveGapFollow::get_turning_speed_limit(
+    float steering_angle, float speed_reference) const
+{
+    const float modeled_curvature = std::abs(
+        this->get_modeled_curvature(steering_angle, speed_reference));
+    if (modeled_curvature <= 1.0e-5F)
+    {
+        return std::numeric_limits<float>::infinity();
+    }
+    const float friction = calibrated_friction_coefficient(
+        static_cast<float>(this->get_parameter("friction").as_double()),
+        speed_reference);
+    return std::sqrt(9.81F * friction / modeled_curvature);
 }
 
 void ReactiveGapFollow::publish_debug_markers(
@@ -678,10 +887,16 @@ void ReactiveGapFollow::publish_debug_markers(
     const PathGuidance& path_guidance,
     float current_steering_angle,
     float prediction_speed,
+    float commanded_speed,
     float collision_ttc,
     float braking_distance,
+    float turning_speed_cap,
+    float trajectory_speed_cap,
     bool emergency,
-    bool braking_for_risk)
+    bool braking_for_risk,
+    bool preview_tracking_active,
+    bool steering_avoidance_active,
+    int steering_avoidance_direction)
 {
     visualization_msgs::msg::MarkerArray marker_array;
 
@@ -708,8 +923,6 @@ void ReactiveGapFollow::publish_debug_markers(
     target_marker.points.push_back(target);
     marker_array.markers.push_back(target_marker);
 
-    const float curvature = this->get_modeled_curvature(
-        steering_angle, prediction_speed);
     const float check_distance = static_cast<float>(
         this->get_parameter("trajectory_check_distance").as_double());
     const float check_step = std::max(
@@ -731,6 +944,26 @@ void ReactiveGapFollow::publish_debug_markers(
         0.0F,
         static_cast<float>(this->get_parameter("vehicle_width").as_double()))
         + safety_margin;
+    const float maximum_steering = static_cast<float>(
+        this->get_parameter("max_steering_angle").as_double()
+        * M_PI / 180.0);
+    const float checked_current_steering = std::max(
+        -maximum_steering,
+        std::min(current_steering_angle, maximum_steering));
+    const float checked_target_steering = std::max(
+        -maximum_steering, std::min(steering_angle, maximum_steering));
+    const float transition_time = std::max(
+        1.0e-3F,
+        static_cast<float>(
+            this->get_parameter("steering_transition_time").as_double()));
+    const float rollout_speed = std::max(0.05F, std::abs(prediction_speed));
+    // A control frame only commits the actuator transition, not a full 1.5 m
+    // of constant target steering. Drawing beyond this time made a hard turn
+    // look like a commanded circle even though the controller replans every
+    // scan. The blue target arrow continues to show the longer-term intent.
+    const float committed_rollout_distance = std::min(
+        check_distance,
+        std::max(check_step, rollout_speed * transition_time));
     float state_color_r = 0.1F;
     float state_color_g = 1.0F;
     float state_color_b = 0.2F;
@@ -747,6 +980,22 @@ void ReactiveGapFollow::publish_debug_markers(
         state_color_r = 1.0F;
         state_color_g = 0.65F;
         state_color_b = 0.0F;
+    }
+    else if (steering_avoidance_active)
+    {
+        // Safe steering avoidance: cyan. It is collision-free, but it is not
+        // ordinary path/gap following and must not be reported as plain CLEAR.
+        state_color_r = 0.0F;
+        state_color_g = 0.85F;
+        state_color_b = 1.0F;
+    }
+    else if (preview_tracking_active)
+    {
+        // PREVIEW: a distant path blocker is being watched, but it has not
+        // entered the physical braking gate and therefore does not reduce speed.
+        state_color_r = 0.75F;
+        state_color_g = 0.25F;
+        state_color_b = 1.0F;
     }
 
     visualization_msgs::msg::Marker trajectory_marker;
@@ -773,24 +1022,20 @@ void ReactiveGapFollow::publish_debug_markers(
     footprint_marker.color.b = state_color_b;
     footprint_marker.color.a = 0.08F;
 
-    for (float travelled = 0.0F; travelled <= check_distance; travelled += check_step)
+    float travelled = 0.0F;
+    float vehicle_x = -lidar_offset_x;
+    float vehicle_y = -lidar_offset_y;
+    float vehicle_yaw = 0.0F;
+    while (travelled <= committed_rollout_distance + 1.0e-4F)
     {
         geometry_msgs::msg::Point point;
-        point.x = travelled - lidar_offset_x;
-        point.y = -lidar_offset_y;
+        point.x = vehicle_x;
+        point.y = vehicle_y;
         point.z = 0.03;
-        if (std::abs(curvature) > 1.0e-5F)
-        {
-            const float yaw = travelled * curvature;
-            point.x = std::sin(yaw) / curvature - lidar_offset_x;
-            point.y = (1.0F - std::cos(yaw)) / curvature - lidar_offset_y;
-        }
         trajectory_marker.points.push_back(point);
 
-        const float yaw = std::abs(curvature) > 1.0e-5F
-            ? travelled * curvature : 0.0F;
-        const float cos_yaw = std::cos(yaw);
-        const float sin_yaw = std::sin(yaw);
+        const float cos_yaw = std::cos(vehicle_yaw);
+        const float sin_yaw = std::sin(vehicle_yaw);
         const std::pair<float, float> local_corners[4] = {
             {half_vehicle_length, half_vehicle_width},
             {half_vehicle_length, -half_vehicle_width},
@@ -813,6 +1058,29 @@ void ReactiveGapFollow::publish_debug_markers(
             footprint_marker.points.push_back(corners[corner_index]);
             footprint_marker.points.push_back(corners[(corner_index + 1) % 4]);
         }
+
+        if (travelled >= committed_rollout_distance)
+        {
+            break;
+        }
+        const float distance_step = std::min(
+            check_step, committed_rollout_distance - travelled);
+        const float midpoint_time
+            = (travelled + 0.5F * distance_step) / rollout_speed;
+        const float transition_steering = modeled_steering_during_transition(
+            checked_current_steering,
+            checked_target_steering,
+            midpoint_time,
+            transition_time,
+            maximum_steering);
+        const float transition_curvature = this->get_modeled_curvature(
+            transition_steering, prediction_speed);
+        const float midpoint_yaw
+            = vehicle_yaw + 0.5F * transition_curvature * distance_step;
+        vehicle_x += std::cos(midpoint_yaw) * distance_step;
+        vehicle_y += std::sin(midpoint_yaw) * distance_step;
+        vehicle_yaw += transition_curvature * distance_step;
+        travelled += distance_step;
     }
     marker_array.markers.push_back(trajectory_marker);
     marker_array.markers.push_back(footprint_marker);
@@ -832,19 +1100,58 @@ void ReactiveGapFollow::publish_debug_markers(
     text_marker.color.b = state_color_b;
     text_marker.color.a = 1.0F;
     std::ostringstream status;
-    status << (emergency ? "STOP" : (braking_for_risk ? "BRAKE" : "CLEAR"))
+    const char* motion_state = emergency
+        ? "STOP"
+        : (braking_for_risk
+            ? "BRAKE"
+            : (steering_avoidance_active
+                ? "AVOID"
+                : (preview_tracking_active ? "PREVIEW" : "CLEAR")));
+    status << motion_state << "  steer_state=";
+    if (!steering_avoidance_active)
+    {
+        status << "FOLLOW";
+    }
+    else if (steering_avoidance_direction > 0)
+    {
+        status << "AVOID_LEFT";
+    }
+    else if (steering_avoidance_direction < 0)
+    {
+        status << "AVOID_RIGHT";
+    }
+    else
+    {
+        status << "AVOID";
+    }
+    status << "  speed=" << prediction_speed
+           << " m/s  cmd_v=" << commanded_speed
+           << " m/s  cmd_out=" << this->vehicle_speed_to_wheel_speed(commanded_speed)
+           << "  speed_src="
+           << (braking_for_risk
+                ? "RISK"
+                : (path_guidance.speed_available ? "PATH" : "LIDAR"))
            << "  steer="
            << steering_angle * 180.0F / static_cast<float>(M_PI)
            << " deg  current="
            << current_steering_angle * 180.0F / static_cast<float>(M_PI)
            << " deg  collision=" << collision_distance
            << " m  ttc=" << collision_ttc
-           << " s  brake=" << braking_distance << " m";
-    if (path_guidance.active)
+           << " s  brake=" << braking_distance << " m"
+           << "  turn_cap=" << turning_speed_cap << " m/s"
+           << "  traj_cap=" << trajectory_speed_cap << " m/s"
+           << "  detect="
+           << this->get_parameter("obstacle_detection_distance").as_double()
+           << " m  rollout=" << committed_rollout_distance << " m";
+    if (path_guidance.available)
     {
         status << "  path="
                << path_guidance.target_angle * 180.0F / static_cast<float>(M_PI)
                << " deg  error=" << path_guidance.cross_track_error << " m";
+        if (path_guidance.speed_available)
+        {
+            status << "  path_v=" << path_guidance.target_speed << " m/s";
+        }
     }
     text_marker.text = status.str();
     marker_array.markers.push_back(text_marker);
@@ -879,7 +1186,7 @@ void ReactiveGapFollow::publish_debug_markers(
         marker_array.markers.push_back(path_marker);
     }
 
-    if (path_guidance.active)
+    if (path_guidance.available)
     {
         visualization_msgs::msg::Marker path_target_marker;
         path_target_marker.header.stamp = header.stamp;
@@ -1100,12 +1407,17 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     const std::vector<float> raw_ranges = ranges;
     const auto decision_time = this->now();
 
+    const float obstacle_detection_distance = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("obstacle_detection_distance").as_double()));
     std::vector<std::pair<float, float>> obstacle_points;
     obstacle_points.reserve(raw_ranges.size());
     for (size_t i = 0; i < raw_ranges.size(); ++i)
     {
         const float range = raw_ranges[i];
         if (!std::isfinite(range) || range <= 0.0F
+            || range > obstacle_detection_distance
             || range >= scan_msg->range_max * 0.99F)
         {
             continue;
@@ -1115,11 +1427,13 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             range * std::cos(angle), range * std::sin(angle));
     }
 
-    const double odom_age = has_localization
-        ? (decision_time - latest_localization_receive_time).seconds()
+    const double odometry_timeout = std::max(
+        0.0, this->get_parameter("odom_timeout").as_double());
+    const double speed_odometry_age = has_speed_odometry
+        ? (decision_time - latest_speed_odometry_receive_time).seconds()
         : std::numeric_limits<double>::infinity();
-    const bool odom_speed_is_fresh = has_localization && odom_age >= 0.0
-        && odom_age <= this->get_parameter("odom_timeout").as_double();
+    const bool speed_odometry_is_fresh = has_speed_odometry
+        && speed_odometry_age >= 0.0 && speed_odometry_age <= odometry_timeout;
     const double steering_feedback_age = has_steering_feedback
         ? (decision_time - latest_steering_feedback_receive_time).seconds()
         : std::numeric_limits<double>::infinity();
@@ -1127,18 +1441,57 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         && steering_feedback_age >= 0.0
         && steering_feedback_age
             <= this->get_parameter("steering_transition_time").as_double();
-    const float current_steering_angle = steering_feedback_is_fresh
+    const float steering_command_reference = steering_feedback_is_fresh
         ? latest_steering_feedback : last_published_steering;
-    const float maximum_odom_speed = 1.25F * std::max(
+    const int64_t decision_time_ns = decision_time.nanoseconds();
+    const float steering_response_time = std::max(
+        1.0e-3F,
+        static_cast<float>(
+            this->get_parameter("steering_transition_time").as_double()));
+    if (estimated_steering_update_time == 0
+        || decision_time_ns < estimated_steering_update_time)
+    {
+        estimated_current_steering = steering_command_reference;
+    }
+    else
+    {
+        const float elapsed = static_cast<float>(
+            decision_time_ns - estimated_steering_update_time) * 1.0e-9F;
+        // A command topic reports where the servo was asked to go. Model the
+        // physical steering response with the already configured transition
+        // time before using it as the initial state of every candidate rollout.
+        // This prevents a rapid command reversal from being treated as if the
+        // wheels had already crossed through the new target angle.
+        const float response_ratio = 1.0F - std::exp(
+            -std::max(0.0F, elapsed) / steering_response_time);
+        estimated_current_steering += response_ratio * (
+            steering_command_reference - estimated_current_steering);
+    }
+    estimated_steering_update_time = decision_time_ns;
+    const float current_steering_angle = estimated_current_steering;
+    const float maximum_vehicle_speed_measurement = 1.25F * std::max(
         0.1F,
         static_cast<float>(this->get_parameter("max_speed").as_double()));
-    const float feedback_speed = steering_feedback_is_fresh
-        ? std::min(latest_speed_feedback, maximum_odom_speed) : 0.0F;
-    const float fallback_speed = std::max(current_speed, feedback_speed);
-    const float actual_speed = odom_speed_is_fresh
-        ? std::max(filtered_odom_speed, fallback_speed)
-        : fallback_speed;
-
+    const float feedback_vehicle_speed = steering_feedback_is_fresh
+        ? std::min(
+            latest_vehicle_speed_feedback, maximum_vehicle_speed_measurement)
+        : 0.0F;
+    const float fallback_vehicle_speed = std::max(
+        current_vehicle_speed, feedback_vehicle_speed);
+    // Fresh wheel odometry is the actual calibrated vehicle speed and is the
+    // only measured-speed input to TTC, braking distance, steering transition
+    // prediction and the speed-dependent curvature model. The requested-speed
+    // gate below separately validates acceleration targets, so an older command
+    // must not masquerade as measured motion while the vehicle is stationary.
+    const float vehicle_speed = speed_odometry_is_fresh
+        ? filtered_vehicle_speed
+        : fallback_vehicle_speed;
+    const PathGuidance path_guidance = this->get_path_guidance();
+    // TTC and braking below must use measured speed. Candidate geometry is
+    // different: while launching from rest the car will accelerate toward the
+    // path command during the 0.2 s steering response. Evaluating candidate
+    // curvature at exactly zero speed produces an unrealistically tiny turning
+    // circle and can reject the path side before the car moves at all.
     const float braking_deceleration = std::max(
         0.1F,
         static_cast<float>(
@@ -1151,13 +1504,43 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         0.0F,
         static_cast<float>(
             this->get_parameter("trajectory_safety_margin").as_double()));
-    const float braking_distance = actual_speed * brake_reaction_time
-        + actual_speed * actual_speed / (2.0F * braking_deceleration)
+    const float braking_distance = vehicle_speed * brake_reaction_time
+        + vehicle_speed * vehicle_speed / (2.0F * braking_deceleration)
         + braking_margin;
-    const float trajectory_check_distance = std::max(
+    const float configured_trajectory_check_distance = std::max(
+        0.0F,
         static_cast<float>(
-            this->get_parameter("trajectory_check_distance").as_double()),
-        braking_distance);
+            this->get_parameter("trajectory_check_distance").as_double()));
+    const float vehicle_length = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("vehicle_length").as_double()));
+    const auto trajectory_check_distance_for_speed = [&](float candidate_speed)
+    {
+        // A high-speed candidate must cover at least the distance travelled
+        // while the actuator moves from the measured steering to the target,
+        // plus the front half of the rectangular footprint. The configured
+        // distance is a baseline, not an upper bound; LiDAR range remains the
+        // only upper bound. This prevents a 1.5 m rollout from approving a
+        // 9 m/s command whose 0.2 s steering response already consumes 1.8 m.
+        const float steering_response_distance
+            = std::abs(candidate_speed) * brake_reaction_time
+            + 0.5F * vehicle_length + braking_margin;
+        return std::min(
+            obstacle_detection_distance,
+            std::max(
+                configured_trajectory_check_distance,
+                std::max(vehicle_length + braking_margin,
+                         steering_response_distance)));
+    };
+    const float trajectory_check_distance
+        = trajectory_check_distance_for_speed(vehicle_speed);
+    // The complete detection horizon starts steering search.  It is deliberately
+    // independent from braking_distance: seeing an obstacle earlier must buy
+    // lateral response time, not automatically reduce speed.  Once a blocker is
+    // found, the candidate rollout below is shortened to just past that blocker
+    // so a distant side wall does not reject every usable detour.
+    const float avoidance_preview_distance = obstacle_detection_distance;
 
     std::vector<float> range_differences;
     std::vector<int> obstacle_edges;
@@ -1198,7 +1581,6 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     const size_t path_check_width = static_cast<size_t>(std::ceil(
         path_check_angle / angle_increment));
     const float safety_level = this->get_parameter("safety_level").as_double();
-    const PathGuidance path_guidance = this->get_path_guidance();
     float preferred_target_distance = 0.0;
     float target_score = 0.0F;
     bool selected_path_preference_applied = false;
@@ -1398,7 +1780,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 obstacle_points,
                 current_steering_angle,
                 target_angle,
-                actual_speed,
+                vehicle_speed,
                 trajectory_check_distance);
         const float fallback_switch_distance = 0.5F * static_cast<float>(
             this->get_parameter("candidate_min_clearance").as_double()
@@ -1411,7 +1793,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     obstacle_points,
                     current_steering_angle,
                     opposite_target_angle,
-                    actual_speed,
+                    vehicle_speed,
                     trajectory_check_distance);
             const float minimum_improvement = static_cast<float>(
                 this->get_parameter("trajectory_check_step").as_double());
@@ -1457,7 +1839,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         obstacle_points,
         current_steering_angle,
         target_angle,
-        actual_speed,
+        vehicle_speed,
         trajectory_check_distance);
     float collision_distance = target_risk.collision_distance;
     float collision_ttc = target_risk.collision_time;
@@ -1466,11 +1848,49 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         0.0F,
         static_cast<float>(
             this->get_parameter("candidate_min_clearance").as_double()));
-    const float minimum_direction_angle = std::max(
+    const float candidate_minimum_speed = std::max(
         0.0F,
         static_cast<float>(
-            this->get_parameter("avoidance_direction_min_angle").as_double()
-            * M_PI / 180.0));
+            this->get_parameter("minimum_non_emergency_speed").as_double()));
+    const float candidate_speed_ceiling = std::min(
+        static_cast<float>(this->get_parameter("max_speed").as_double()),
+        reference_path_max_speed);
+    float candidate_requested_speed = candidate_minimum_speed;
+    if (path_guidance.speed_available)
+    {
+        candidate_requested_speed = std::max(
+            candidate_minimum_speed, path_guidance.target_speed);
+    }
+    else
+    {
+        // Match the fallback branch used by the final speed layer.  This avoids
+        // choosing steering at only the minimum speed and discovering later
+        // that the actual distance/approach-speed request needs another turn.
+        candidate_requested_speed = std::max(
+            set_speed_from_distance(
+                selected_target_distance, target_angle, vehicle_speed),
+            current_vehicle_speed);
+    }
+    candidate_requested_speed = std::min(
+        candidate_requested_speed, candidate_speed_ceiling);
+    const float candidate_trajectory_speed = std::max(
+        vehicle_speed, candidate_requested_speed);
+    // Candidate eligibility stays local even though the steering trigger sees
+    // the full 3 m horizon.  Extending every constant-command rollout to the
+    // full LiDAR distance rejects valid detours when their hypothetical later
+    // continuation reaches a side wall.  The extra preview gate below only
+    // requires the candidate to improve the distant blocker.
+    const float local_avoidance_candidate_check_distance = std::min(
+        obstacle_detection_distance,
+        std::max(
+            trajectory_check_distance_for_speed(candidate_trajectory_speed),
+            configured_trajectory_check_distance
+                + 1.5F * vehicle_length + braking_margin));
+    const float minimum_preview_improvement = std::max(
+        static_cast<float>(
+            this->get_parameter("trajectory_check_step").as_double()),
+        0.5F * static_cast<float>(
+            this->get_parameter("vehicle_width").as_double()));
 
     struct AvoidanceCandidate
     {
@@ -1478,10 +1898,15 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         float angle = 0.0F;
         float collision_distance = std::numeric_limits<float>::infinity();
         float collision_time = std::numeric_limits<float>::infinity();
+        TrajectoryRisk current_speed_preview_risk;
+        TrajectoryRisk requested_speed_preview_risk;
         float score = -std::numeric_limits<float>::infinity();
     };
 
-    const auto find_avoidance_candidate = [&](int required_direction)
+    const auto find_avoidance_candidate = [&] (
+        bool require_preview_improvement,
+        const TrajectoryRisk& current_speed_baseline_preview_risk,
+        const TrajectoryRisk& requested_speed_baseline_preview_risk)
     {
         AvoidanceCandidate best;
         const float scan_last_angle = first_scan_angle
@@ -1509,18 +1934,13 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 this->get_parameter("path_alignment_sigma").as_double()
                 * M_PI / 180.0));
 
+        std::vector<AvoidanceCandidate> safe_candidates;
+        float lidar_best_score = -std::numeric_limits<float>::infinity();
         for (float candidate_angle = search_min_angle;
             candidate_angle <= search_max_angle + 0.5F * search_step;
             candidate_angle += search_step)
         {
             const float checked_angle = std::min(candidate_angle, search_max_angle);
-            if (required_direction != 0
-                && static_cast<float>(required_direction) * checked_angle
-                    < minimum_direction_angle)
-            {
-                continue;
-            }
-
             // Eligibility uses the lower candidate quantile so a narrow static
             // obstacle cannot be hidden by the broad p80 scoring clearance.
             const float guard_clearance
@@ -1534,14 +1954,74 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     obstacle_points,
                     current_steering_angle,
                     checked_angle,
-                    actual_speed,
-                    trajectory_check_distance);
-            // An escape trajectory must clear the complete prediction horizon.
-            // A collision just beyond the current braking distance is still a
-            // collision, not a valid avoidance candidate.
+                    candidate_trajectory_speed,
+                    local_avoidance_candidate_check_distance);
+            // The candidate must clear the complete maneuver horizon above.
+            // A later side-wall intersection of the hypothetical constant-turn
+            // continuation is not part of this maneuver and is replanned from
+            // the next scan instead.
             if (std::isfinite(candidate_risk.collision_distance))
             {
                 continue;
+            }
+            const bool distinct_candidate_speed
+                = std::abs(candidate_trajectory_speed - vehicle_speed) > 0.05F;
+            const TrajectoryRisk current_speed_candidate_risk
+                = distinct_candidate_speed
+                ? this->get_transition_trajectory_risk(
+                    obstacle_points,
+                    current_steering_angle,
+                    checked_angle,
+                    vehicle_speed,
+                    local_avoidance_candidate_check_distance)
+                : candidate_risk;
+            if (std::isfinite(current_speed_candidate_risk.collision_distance))
+            {
+                continue;
+            }
+
+            TrajectoryRisk current_speed_candidate_preview_risk;
+            TrajectoryRisk requested_speed_candidate_preview_risk;
+            if (require_preview_improvement)
+            {
+                requested_speed_candidate_preview_risk
+                    = this->get_transition_trajectory_risk(
+                    obstacle_points,
+                    current_steering_angle,
+                    checked_angle,
+                    candidate_trajectory_speed,
+                    avoidance_preview_distance);
+                current_speed_candidate_preview_risk = distinct_candidate_speed
+                    ? this->get_transition_trajectory_risk(
+                        obstacle_points,
+                        current_steering_angle,
+                        checked_angle,
+                        vehicle_speed,
+                        avoidance_preview_distance)
+                    : requested_speed_candidate_preview_risk;
+                const auto preserves_or_improves = [&] (
+                    const TrajectoryRisk& candidate_preview_risk,
+                    const TrajectoryRisk& baseline_preview_risk)
+                {
+                    if (!std::isfinite(baseline_preview_risk.collision_distance))
+                    {
+                        return !std::isfinite(
+                            candidate_preview_risk.collision_distance);
+                    }
+                    return !std::isfinite(candidate_preview_risk.collision_distance)
+                        || candidate_preview_risk.collision_distance
+                            >= baseline_preview_risk.collision_distance
+                                + minimum_preview_improvement;
+                };
+                if (!preserves_or_improves(
+                        current_speed_candidate_preview_risk,
+                        current_speed_baseline_preview_risk)
+                    || !preserves_or_improves(
+                        requested_speed_candidate_preview_risk,
+                        requested_speed_baseline_preview_risk))
+                {
+                    continue;
+                }
             }
 
             // Rank only after the guard-clearance and rectangular transition
@@ -1554,23 +2034,47 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 - steering_change_penalty * (
                     std::abs(checked_angle - target_angle)
                     + std::abs(checked_angle - current_steering_angle));
-            if (path_guidance.active)
+            AvoidanceCandidate candidate;
+            candidate.valid = true;
+            candidate.score = candidate_score;
+            candidate.angle = checked_angle;
+            candidate.collision_distance = candidate_risk.collision_distance;
+            candidate.collision_time = candidate_risk.collision_time;
+            candidate.current_speed_preview_risk
+                = current_speed_candidate_preview_risk;
+            candidate.requested_speed_preview_risk
+                = requested_speed_candidate_preview_risk;
+            safe_candidates.push_back(candidate);
+            lidar_best_score = std::max(lidar_best_score, candidate_score);
+        }
+
+        // Every entry already passed the guard and rectangular-trajectory gates.
+        // Path alignment is a soft score only.  A hard sign(path_angle) filter
+        // made the chosen side flip whenever a near-zero path bearing crossed
+        // zero, cancelling the physical steering response despite no latch.
+        const float minimum_score_ratio = std::max(
+            0.0F,
+            std::min(
+                1.0F,
+                static_cast<float>(
+                    this->get_parameter("path_candidate_min_score_ratio").as_double())));
+        for (auto candidate : safe_candidates)
+        {
+            const bool path_safe_candidate = path_guidance.active
+                && candidate.score >= lidar_best_score * minimum_score_ratio;
+            if (path_safe_candidate)
             {
                 const float path_difference = static_cast<float>(normalize_angle(
-                    checked_angle - path_guidance.target_angle));
+                    candidate.angle - path_guidance.target_angle));
                 const float normalized_difference
                     = path_difference / path_alignment_sigma;
                 const float alignment = std::exp(
                     -0.5F * normalized_difference * normalized_difference);
-                candidate_score += path_guidance.score_weight * alignment;
+                candidate.score += path_guidance.score_weight * alignment;
             }
-            if (candidate_score > best.score)
+            if (candidate.score > best.score)
             {
-                best.valid = true;
-                best.score = candidate_score;
-                best.angle = checked_angle;
-                best.collision_distance = candidate_risk.collision_distance;
-                best.collision_time = candidate_risk.collision_time;
+                best = candidate;
             }
         }
         return best;
@@ -1589,382 +2093,182 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         target_angle = this->smooth_steering(target_angle);
     };
 
-    const int64_t decision_time_ns = decision_time.nanoseconds();
-    const auto reset_pending_direction_switch = [&]()
+    // Look across the full detection range at the speed the path may request.
+    // This is a steering trigger, not a distance-based braking trigger.  The
+    // selected candidate only needs to be locally collision-free and to move
+    // the distant collision meaningfully farther away; the controller replans
+    // before that later point is reached.
+    const bool distinct_candidate_speed
+        = std::abs(candidate_trajectory_speed - vehicle_speed) > 0.05F;
+    const TrajectoryRisk requested_speed_target_preview_risk
+        = this->get_transition_trajectory_risk(
+            obstacle_points,
+            current_steering_angle,
+            target_angle,
+            candidate_trajectory_speed,
+            avoidance_preview_distance);
+    const TrajectoryRisk current_speed_target_preview_risk
+        = distinct_candidate_speed
+        ? this->get_transition_trajectory_risk(
+            obstacle_points,
+            current_steering_angle,
+            target_angle,
+            vehicle_speed,
+            avoidance_preview_distance)
+        : requested_speed_target_preview_risk;
+    TrajectoryRisk requested_speed_route_preview_risk;
+    TrajectoryRisk current_speed_route_preview_risk;
+    if (path_guidance.active)
     {
-        pending_avoidance_direction = 0;
-        pending_avoidance_direction_start_time = 0;
-    };
-    const auto reset_avoidance_speed_state = [&]()
+        const float reference_path_angle
+            = clamp_steering(path_guidance.target_angle);
+        requested_speed_route_preview_risk
+            = this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                reference_path_angle,
+                candidate_trajectory_speed,
+                avoidance_preview_distance);
+        current_speed_route_preview_risk = distinct_candidate_speed
+            ? this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                reference_path_angle,
+                vehicle_speed,
+                avoidance_preview_distance)
+            : requested_speed_route_preview_risk;
+    }
+    else
     {
-        avoidance_entry_speed = 0.0F;
-        avoidance_speed_safe_start_time = 0;
-    };
-    if (avoidance_direction != 0
-        && decision_time_ns < avoidance_direction_start_time)
-    {
-        // ROS time can jump backwards when replaying a bag.
-        avoidance_direction = 0;
-        avoidance_direction_start_time = 0;
-        avoidance_clear_start_time = 0;
-        avoidance_direction_switched = false;
-        reset_pending_direction_switch();
-        avoidance_obstacle_locked = false;
-        reset_avoidance_speed_state();
+        requested_speed_route_preview_risk
+            = this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                0.0F,
+                candidate_trajectory_speed,
+                avoidance_preview_distance);
+        current_speed_route_preview_risk = distinct_candidate_speed
+            ? this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                0.0F,
+                vehicle_speed,
+                avoidance_preview_distance)
+            : requested_speed_route_preview_risk;
     }
 
-    const float straight_guard_clearance = guard_clearance_for_angle(0.0F);
+    const bool target_preview_is_blocked
+        = std::isfinite(current_speed_target_preview_risk.collision_distance)
+        || std::isfinite(requested_speed_target_preview_risk.collision_distance);
+    const bool route_preview_is_blocked
+        = std::isfinite(current_speed_route_preview_risk.collision_distance)
+        || std::isfinite(requested_speed_route_preview_risk.collision_distance);
+    const bool preview_tracked
+        = target_preview_is_blocked || route_preview_is_blocked;
+    TrajectoryRisk current_speed_selected_preview_risk
+        = current_speed_target_preview_risk;
+    TrajectoryRisk requested_speed_selected_preview_risk
+        = requested_speed_target_preview_risk;
+    if (target_preview_is_blocked)
+    {
+        const AvoidanceCandidate early_candidate
+            = find_avoidance_candidate(
+                true,
+                current_speed_target_preview_risk,
+                requested_speed_target_preview_risk);
+        if (early_candidate.valid)
+        {
+            apply_avoidance_candidate(early_candidate);
+            current_speed_selected_preview_risk
+                = early_candidate.current_speed_preview_risk;
+            requested_speed_selected_preview_risk
+                = early_candidate.requested_speed_preview_risk;
+        }
+    }
+    else if (route_preview_is_blocked)
+    {
+        // The ordinary gap target is already a full-horizon safe detour around
+        // a blocked reference/straight route. Keep that better target exactly
+        // as-is and only expose that it is active avoidance.
+        using_steering_avoidance = true;
+    }
+
     const TrajectoryRisk straight_risk = this->get_transition_trajectory_risk(
         obstacle_points,
         current_steering_angle,
         0.0F,
-        actual_speed,
-        trajectory_check_distance);
+        vehicle_speed,
+        avoidance_preview_distance);
     const float straight_collision_distance = straight_risk.collision_distance;
-    const float direction_hold_time = std::max(
-        0.0F,
-        static_cast<float>(
-            this->get_parameter("avoidance_direction_hold_time").as_double()));
-    const float direction_release_time = 0.5F * direction_hold_time;
-    // Reuse the measured steering transition time instead of adding another
-    // tuning parameter. A one-scan opening on the opposite side is not enough
-    // to reverse an established avoidance command.
-    const float direction_switch_confirmation_time = std::max(
-        0.0F,
-        static_cast<float>(
-            this->get_parameter("steering_transition_time").as_double()));
-    const float direction_release_clearance
-        = 2.0F * minimum_avoidance_clearance;
-
-    const auto lock_avoidance_obstacle = [&](const TrajectoryRisk& risk)
-    {
-        if (!odom_speed_is_fresh
-            || !std::isfinite(risk.collision_obstacle_x)
-            || !std::isfinite(risk.collision_obstacle_y))
-        {
-            return false;
-        }
-
-        const auto& pose = latest_localization.pose.pose;
-        const double sin_yaw = 2.0 * (
-            pose.orientation.w * pose.orientation.z
-            + pose.orientation.x * pose.orientation.y);
-        const double cos_yaw = 1.0 - 2.0 * (
-            pose.orientation.y * pose.orientation.y
-            + pose.orientation.z * pose.orientation.z);
-        const double yaw = std::atan2(sin_yaw, cos_yaw);
-        const double local_x = static_cast<double>(risk.collision_obstacle_x)
-            + this->get_parameter("lidar_offset_x").as_double();
-        const double local_y = static_cast<double>(risk.collision_obstacle_y)
-            + this->get_parameter("lidar_offset_y").as_double();
-        avoidance_obstacle_global_x = pose.position.x
-            + std::cos(yaw) * local_x - std::sin(yaw) * local_y;
-        avoidance_obstacle_global_y = pose.position.y
-            + std::sin(yaw) * local_x + std::cos(yaw) * local_y;
-        avoidance_obstacle_locked = true;
-        return true;
-    };
-
-    // Older latch state (for example after a hot parameter/code restart) may
-    // not yet have an obstacle anchor. Acquire it as soon as the straight
-    // transition identifies the point that is forcing avoidance.
-    if (avoidance_direction != 0 && !avoidance_obstacle_locked)
-    {
-        lock_avoidance_obstacle(straight_risk);
-    }
-
-    bool tracked_obstacle_has_been_passed = false;
-    if (avoidance_obstacle_locked && odom_speed_is_fresh)
-    {
-        const auto& pose = latest_localization.pose.pose;
-        const double sin_yaw = 2.0 * (
-            pose.orientation.w * pose.orientation.z
-            + pose.orientation.x * pose.orientation.y);
-        const double cos_yaw = 1.0 - 2.0 * (
-            pose.orientation.y * pose.orientation.y
-            + pose.orientation.z * pose.orientation.z);
-        const double difference_x
-            = avoidance_obstacle_global_x - pose.position.x;
-        const double difference_y
-            = avoidance_obstacle_global_y - pose.position.y;
-        const double obstacle_x_in_vehicle
-            = cos_yaw * difference_x + sin_yaw * difference_y;
-        // The stored point is normally on the obstacle's front face. Require
-        // it to clear the rear half of the car plus one vehicle width (about
-        // the known 30 cm obstacle depth) and the common trajectory margin.
-        const double pass_clearance
-            = 0.5 * this->get_parameter("vehicle_length").as_double()
-            + this->get_parameter("vehicle_width").as_double()
-            + this->get_parameter("trajectory_safety_margin").as_double();
-        tracked_obstacle_has_been_passed
-            = obstacle_x_in_vehicle <= -pass_clearance;
-    }
-    // If odometry was unavailable when the latch began, retain the legacy
-    // forward-clear fallback. Normal operation uses the fixed odom anchor.
-    const bool avoidance_obstacle_has_cleared = avoidance_obstacle_locked
-        ? tracked_obstacle_has_been_passed
-        : !std::isfinite(straight_collision_distance);
-
-    if (avoidance_direction != 0)
-    {
-        const double held_seconds = static_cast<double>(
-            decision_time_ns - avoidance_direction_start_time) * 1.0e-9;
-        const bool straight_is_clear
-            = straight_guard_clearance >= direction_release_clearance
-            && !std::isfinite(straight_collision_distance)
-            && avoidance_obstacle_has_cleared;
-        if (held_seconds >= direction_hold_time && straight_is_clear)
-        {
-            if (avoidance_clear_start_time == 0)
-            {
-                avoidance_clear_start_time = decision_time_ns;
-            }
-            const double clear_seconds = static_cast<double>(
-                decision_time_ns - avoidance_clear_start_time) * 1.0e-9;
-            if (clear_seconds >= direction_release_time)
-            {
-                RCLCPP_DEBUG(
-                    this->get_logger(),
-                    "Released avoidance direction after %.2f s of clear path",
-                    clear_seconds);
-                avoidance_direction = 0;
-                avoidance_direction_start_time = 0;
-                avoidance_clear_start_time = 0;
-                avoidance_direction_switched = false;
-                reset_pending_direction_switch();
-                avoidance_obstacle_locked = false;
-                reset_avoidance_speed_state();
-            }
-        }
-        else
-        {
-            avoidance_clear_start_time = 0;
-        }
-    }
-
-    if (avoidance_direction != 0 && path_guidance.active)
-    {
-        const double held_seconds = static_cast<double>(
-            decision_time_ns - avoidance_direction_start_time) * 1.0e-9;
-        const float path_rejoin_angle = clamp_steering(path_guidance.target_angle);
-        const bool path_leaves_held_side
-            = static_cast<float>(avoidance_direction) * path_rejoin_angle
-                < minimum_direction_angle;
-        // Keep the initially selected side until the obstacle that triggered
-        // avoidance has physically passed behind the vehicle. Merely shifting
-        // sideways can make the current straight trajectory look clear while
-        // the same obstacle is still alongside, which otherwise causes an
-        // avoid-rejoin-avoid zigzag.
-        if (held_seconds >= direction_hold_time
-            && path_leaves_held_side
-            && avoidance_obstacle_has_cleared)
-        {
-            const float path_guard_clearance
-                = guard_clearance_for_angle(path_rejoin_angle);
-            const TrajectoryRisk path_rejoin_risk
-                = this->get_transition_trajectory_risk(
-                    obstacle_points,
-                    current_steering_angle,
-                    path_rejoin_angle,
-                    actual_speed,
-                    trajectory_check_distance);
-            const bool path_rejoin_is_safe
-                = path_guard_clearance >= minimum_avoidance_clearance
-                && !std::isfinite(path_rejoin_risk.collision_distance);
-            if (path_rejoin_is_safe)
-            {
-                AvoidanceCandidate path_rejoin_candidate;
-                path_rejoin_candidate.valid = true;
-                path_rejoin_candidate.angle = path_rejoin_angle;
-                path_rejoin_candidate.collision_distance
-                    = path_rejoin_risk.collision_distance;
-                path_rejoin_candidate.collision_time
-                    = path_rejoin_risk.collision_time;
-
-                RCLCPP_DEBUG(
-                    this->get_logger(),
-                    "Released avoidance direction for safe path rejoin at %.1f deg",
-                    path_rejoin_angle * 180.0F / static_cast<float>(M_PI));
-                avoidance_direction = 0;
-                avoidance_direction_start_time = 0;
-                avoidance_clear_start_time = 0;
-                avoidance_direction_switched = false;
-                reset_pending_direction_switch();
-                avoidance_obstacle_locked = false;
-                reset_avoidance_speed_state();
-                apply_avoidance_candidate(path_rejoin_candidate);
-            }
-        }
-    }
-
-    const auto make_held_braking_candidate = [&]()
-    {
-        const float held_angle = clamp_steering(
-            static_cast<float>(avoidance_direction) * std::max(
-                minimum_direction_angle,
-                std::abs(last_published_steering)));
-        const TrajectoryRisk held_braking_risk
-            = this->get_transition_trajectory_risk(
-                obstacle_points,
-                current_steering_angle,
-                held_angle,
-                actual_speed,
-                trajectory_check_distance);
-        AvoidanceCandidate held_braking_candidate;
-        held_braking_candidate.valid = true;
-        held_braking_candidate.angle = held_angle;
-        held_braking_candidate.collision_distance
-            = held_braking_risk.collision_distance;
-        held_braking_candidate.collision_time
-            = held_braking_risk.collision_time;
-        return held_braking_candidate;
-    };
-
-    const auto try_confirmed_opposite_switch = [&] (
-        const AvoidanceCandidate& opposite_candidate,
-        const AvoidanceCandidate& held_braking_candidate)
-    {
-        if (avoidance_direction == 0
-            || avoidance_direction_switched
-            || !opposite_candidate.valid)
-        {
-            reset_pending_direction_switch();
-            return false;
-        }
-
-        const int opposite_direction = -avoidance_direction;
-        if (pending_avoidance_direction != opposite_direction)
-        {
-            pending_avoidance_direction = opposite_direction;
-            pending_avoidance_direction_start_time = decision_time_ns;
-        }
-        const double confirmed_seconds = static_cast<double>(
-            decision_time_ns - pending_avoidance_direction_start_time) * 1.0e-9;
-        const bool imminent_collision
-            = std::isfinite(held_braking_candidate.collision_time)
-            && held_braking_candidate.collision_time
-                <= direction_switch_confirmation_time;
-        const bool continuously_safe
-            = confirmed_seconds >= direction_switch_confirmation_time;
-        if (!imminent_collision && !continuously_safe)
-        {
-            return false;
-        }
-
-        avoidance_direction = opposite_direction;
-        avoidance_direction_start_time = decision_time_ns;
-        avoidance_clear_start_time = 0;
-        avoidance_direction_switched = true;
-        avoidance_speed_safe_start_time = 0;
-        reset_pending_direction_switch();
-        apply_avoidance_candidate(opposite_candidate);
-        return true;
-    };
-
-    if (avoidance_direction != 0)
-    {
-        const bool target_keeps_direction
-            = static_cast<float>(avoidance_direction) * target_angle
-                >= minimum_direction_angle;
-        const float target_guard_clearance
-            = guard_clearance_for_angle(target_angle);
-        const bool target_trajectory_is_safe
-            = target_guard_clearance >= minimum_avoidance_clearance
-            && !std::isfinite(collision_distance);
-        if (!target_keeps_direction || !target_trajectory_is_safe)
-        {
-            const AvoidanceCandidate held_side_candidate
-                = find_avoidance_candidate(avoidance_direction);
-            if (held_side_candidate.valid)
-            {
-                reset_pending_direction_switch();
-                apply_avoidance_candidate(held_side_candidate);
-            }
-            else
-            {
-                // Change sides only when the opposite side has a completely
-                // collision-free transition. If neither side is safe, retain
-                // the committed steering sign while BRAKE/STOP reduces speed;
-                // repeatedly dropping the latch here makes the deepest finite
-                // candidate alternate left/right on every scan.
-                const AvoidanceCandidate opposite_side_candidate
-                    = find_avoidance_candidate(-avoidance_direction);
-                const AvoidanceCandidate held_braking_candidate
-                    = make_held_braking_candidate();
-                if (!try_confirmed_opposite_switch(
-                        opposite_side_candidate, held_braking_candidate))
-                {
-                    apply_avoidance_candidate(held_braking_candidate);
-                }
-            }
-        }
-        else
-        {
-            reset_pending_direction_switch();
-        }
-    }
-
-    // Final independent safety gate. Recompute the exact transition for the
-    // command produced after smoothing, latch and path-rejoin logic. Any finite
-    // collision in the prediction horizon searches the latched side first and
-    // uses the same confirmed one-switch rule as the main latch branch. This
-    // gate must not silently undo the direction commitment.
+    // Final independent safety gate. Recompute the exact transition after
+    // smoothing and per-scan path preference. If it is blocked, compare every
+    // safe steering candidate again without preserving a previous side.
     target_risk = this->get_transition_trajectory_risk(
         obstacle_points,
         current_steering_angle,
         target_angle,
-        actual_speed,
+        vehicle_speed,
         trajectory_check_distance);
     collision_distance = target_risk.collision_distance;
     collision_ttc = target_risk.collision_time;
     if (std::isfinite(collision_distance))
     {
-        bool final_candidate_applied = false;
-        if (avoidance_direction != 0)
+        const AvoidanceCandidate candidate = find_avoidance_candidate(
+            preview_tracked,
+            current_speed_selected_preview_risk,
+            requested_speed_selected_preview_risk);
+        if (candidate.valid)
         {
-            const AvoidanceCandidate held_side_candidate
-                = find_avoidance_candidate(avoidance_direction);
-            if (held_side_candidate.valid)
+            apply_avoidance_candidate(candidate);
+            if (preview_tracked)
             {
-                reset_pending_direction_switch();
-                apply_avoidance_candidate(held_side_candidate);
-                final_candidate_applied = true;
+                current_speed_selected_preview_risk
+                    = candidate.current_speed_preview_risk;
+                requested_speed_selected_preview_risk
+                    = candidate.requested_speed_preview_risk;
             }
-            else
-            {
-                const AvoidanceCandidate opposite_side_candidate
-                    = find_avoidance_candidate(-avoidance_direction);
-                const AvoidanceCandidate held_braking_candidate
-                    = make_held_braking_candidate();
-                if (!try_confirmed_opposite_switch(
-                        opposite_side_candidate, held_braking_candidate))
-                {
-                    apply_avoidance_candidate(held_braking_candidate);
-                }
-                final_candidate_applied = true;
-            }
-        }
-        else
-        {
-            const AvoidanceCandidate candidate = find_avoidance_candidate(0);
-            if (candidate.valid)
-            {
-                apply_avoidance_candidate(candidate);
-                final_candidate_applied = true;
-            }
-        }
-        if (final_candidate_applied)
-        {
             // apply_avoidance_candidate() resets smoothing, but verify its final
             // output rather than relying on the candidate's pre-apply values.
             target_risk = this->get_transition_trajectory_risk(
                 obstacle_points,
                 current_steering_angle,
                 target_angle,
-                actual_speed,
+                vehicle_speed,
                 trajectory_check_distance);
             collision_distance = target_risk.collision_distance;
             collision_ttc = target_risk.collision_time;
+        }
+    }
+
+    // A far blocker that has no completely clear candidate is kept separate
+    // from immediate risk.  It reaches the speed layer only when the selected
+    // transition is inside the physically attainable stopping distance.  This
+    // fixes the old overwrite where a 3 m risk was immediately replaced by a
+    // short 1.5 m CLEAR result.
+    if (preview_tracked)
+    {
+        current_speed_selected_preview_risk
+            = this->get_transition_trajectory_risk(
+            obstacle_points,
+            current_steering_angle,
+            target_angle,
+            vehicle_speed,
+            avoidance_preview_distance);
+        const float preview_braking_gate = braking_distance + std::max(
+            0.01F,
+            static_cast<float>(
+                this->get_parameter("trajectory_check_step").as_double()));
+        if (std::isfinite(
+                current_speed_selected_preview_risk.collision_distance)
+            && current_speed_selected_preview_risk.collision_distance
+                <= preview_braking_gate
+            && (!std::isfinite(collision_distance)
+                || current_speed_selected_preview_risk.collision_distance
+                    < collision_distance))
+        {
+            collision_distance
+                = current_speed_selected_preview_risk.collision_distance;
+            collision_ttc = current_speed_selected_preview_risk.collision_time;
         }
     }
 
@@ -1977,11 +2281,10 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
 
     // A straight-only trigger starts too late once the vehicle has already
     // yawed away from a centerline obstacle. Detect the same condition on the
-    // locked global-path direction, so the first safe detour is committed
-    // before ordinary gap scoring can alternate around the blocked path.
-    TrajectoryRisk latch_trigger_risk = straight_risk;
+    // locked global-path direction. This is recomputed every scan and does not
+    // commit either steering side over time.
     bool obstacle_on_reference_path = false;
-    if (avoidance_direction == 0 && path_guidance.active)
+    if (path_guidance.active)
     {
         const float reference_path_angle
             = clamp_steering(path_guidance.target_angle);
@@ -1990,8 +2293,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 obstacle_points,
                 current_steering_angle,
                 reference_path_angle,
-                actual_speed,
-                trajectory_check_distance);
+                vehicle_speed,
+                avoidance_preview_distance);
         const float reference_path_guard_clearance
             = guard_clearance_for_angle(reference_path_angle);
         const bool reference_path_is_blocked
@@ -1999,33 +2302,14 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             || std::isfinite(reference_path_risk.collision_distance);
         const float detour_from_reference_path = static_cast<float>(std::abs(
             normalize_angle(target_angle - reference_path_angle)));
+        const float path_detour_threshold = 0.5F * std::max(
+            angle_increment,
+            static_cast<float>(
+                this->get_parameter("avoidance_steering_step").as_double()
+                * M_PI / 180.0));
         obstacle_on_reference_path
             = reference_path_is_blocked
-            && detour_from_reference_path >= minimum_direction_angle;
-        if (obstacle_on_reference_path)
-        {
-            latch_trigger_risk = reference_path_risk;
-        }
-    }
-
-    if (avoidance_direction == 0
-        && (obstacle_on_straight_trajectory || obstacle_on_reference_path)
-        && final_trajectory_is_safe
-        && std::abs(target_angle) >= minimum_direction_angle)
-    {
-        avoidance_direction = target_angle > 0.0F ? 1 : -1;
-        avoidance_direction_start_time = decision_time_ns;
-        avoidance_clear_start_time = 0;
-        avoidance_direction_switched = false;
-        avoidance_entry_speed = std::max(actual_speed, current_speed);
-        avoidance_speed_safe_start_time = decision_time_ns;
-        reset_pending_direction_switch();
-        lock_avoidance_obstacle(latch_trigger_risk);
-        RCLCPP_DEBUG(
-            this->get_logger(),
-            "Latched avoidance direction %s at %.1f deg",
-            avoidance_direction > 0 ? "left" : "right",
-            target_angle * 180.0F / static_cast<float>(M_PI));
+            && detour_from_reference_path >= path_detour_threshold;
     }
 
     const size_t commanded_index = index_for_angle(target_angle);
@@ -2045,19 +2329,19 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             ? std::min(target_distance, front_distance)
             : target_distance);
 
-    // TTC and braking distance are a fallback after the steering search. A
-    // collision-free candidate leaves collision_distance infinite and preserves
-    // normal speed. Otherwise begin a comfortable stop-speed cap immediately;
-    // it only lowers the command once the available distance actually requires it.
+    // Preserve the risk of executing the selected steering at the measured
+    // speed. A second check at the requested speed is performed below, after
+    // path and curvature speed targets have been combined.
     const float critical_ttc = std::max(
         0.0F,
         static_cast<float>(
             this->get_parameter("steering_transition_time").as_double()));
-    const bool braking_for_risk = std::isfinite(collision_distance);
-    const bool emergency = std::isfinite(collision_distance)
+    const bool current_trajectory_has_risk
+        = std::isfinite(collision_distance);
+    const bool emergency = current_trajectory_has_risk
         && collision_ttc <= critical_ttc;
     float risk_speed_cap = std::numeric_limits<float>::infinity();
-    if (braking_for_risk)
+    if (current_trajectory_has_risk)
     {
         const float available_distance = std::max(
             0.0F, collision_distance - braking_margin);
@@ -2076,86 +2360,289 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     new_msg.header.frame_id = this->get_parameter("command_frame_id").as_string();
     new_msg.drive.steering_angle = target_angle;
     float desired_speed = set_speed_from_distance(
-        safe_distance, target_angle, actual_speed);
+        safe_distance, target_angle, vehicle_speed);
+    const bool safe_avoidance_context
+        = using_steering_avoidance
+        || preview_tracked
+        || obstacle_on_straight_trajectory
+        || obstacle_on_reference_path;
     const bool preserve_safe_avoidance_speed
         = final_trajectory_is_safe
-        && !braking_for_risk
-        && (avoidance_direction != 0 || using_steering_avoidance);
-    if (preserve_safe_avoidance_speed)
+        && !current_trajectory_has_risk
+        && safe_avoidance_context;
+    const bool use_path_speed
+        = final_trajectory_is_safe
+        && !current_trajectory_has_risk
+        && path_guidance.speed_available;
+    if (use_path_speed)
     {
-        // Do not reduce speed merely because the selected LiDAR direction
-        // passes close to the obstacle. Retain the current command immediately.
-        // Recover the latched entry speed only after the exact transition is
-        // also collision-free at that higher speed and its longer brake horizon.
-        const float speed_ceiling_distance = std::max(
-            safe_distance,
+        // In every collision-free state, position.z on the locked global path
+        // is the speed target. Corridor width and nearby side walls choose the
+        // steering candidate but must not quietly turn into a speed command.
+        const float maximum_speed = static_cast<float>(
+            this->get_parameter("max_speed").as_double());
+        desired_speed = std::max(
             static_cast<float>(
-                this->get_parameter("speed_increase_end").as_double()));
-        const float safe_avoidance_speed_ceiling = set_speed_from_distance(
-            speed_ceiling_distance, target_angle, actual_speed);
-        const float retained_speed = std::min(
-            current_speed, safe_avoidance_speed_ceiling);
-        float safe_avoidance_speed_floor = retained_speed;
-        if (avoidance_direction != 0)
-        {
-            const float entry_speed_target = std::min(
-                avoidance_entry_speed, safe_avoidance_speed_ceiling);
-            const float entry_speed_braking_distance
-                = entry_speed_target * brake_reaction_time
-                + entry_speed_target * entry_speed_target
-                    / (2.0F * braking_deceleration)
-                + braking_margin;
-            const float entry_speed_check_distance = std::max(
-                trajectory_check_distance, entry_speed_braking_distance);
-            const TrajectoryRisk entry_speed_risk
-                = this->get_transition_trajectory_risk(
-                    obstacle_points,
-                    current_steering_angle,
-                    target_angle,
-                    entry_speed_target,
-                    entry_speed_check_distance);
-            const bool entry_speed_trajectory_is_safe
-                = !std::isfinite(entry_speed_risk.collision_distance);
-            if (!entry_speed_trajectory_is_safe)
-            {
-                avoidance_speed_safe_start_time = 0;
-            }
-            else
-            {
-                if (avoidance_speed_safe_start_time == 0)
-                {
-                    avoidance_speed_safe_start_time = decision_time_ns;
-                }
-                const double safe_seconds = static_cast<double>(
-                    decision_time_ns - avoidance_speed_safe_start_time) * 1.0e-9;
-                if (safe_seconds >= direction_switch_confirmation_time)
-                {
-                    safe_avoidance_speed_floor = entry_speed_target;
-                }
-            }
-        }
-        desired_speed = std::max(desired_speed, safe_avoidance_speed_floor);
+                this->get_parameter("minimum_non_emergency_speed").as_double()),
+            std::min(path_guidance.target_speed, maximum_speed));
     }
-    else if (avoidance_direction != 0)
+    else if (preserve_safe_avoidance_speed)
     {
-        avoidance_speed_safe_start_time = 0;
+        // With no valid path speed, retain the approach speed when possible.
+        // The common curvature and requested-speed trajectory gates below are
+        // still authoritative and may lower it when that speed is not feasible.
+        const float maximum_speed = static_cast<float>(
+            this->get_parameter("max_speed").as_double());
+        // A path without a valid z value retains the legacy behavior as a
+        // fallback, rather than inventing a speed.
+        const float retained_speed = std::min(
+            current_vehicle_speed, maximum_speed);
+        desired_speed = std::max(desired_speed, retained_speed);
     }
-    if (using_narrow_gap)
+    if (using_narrow_gap
+        && !use_path_speed
+        && !preserve_safe_avoidance_speed)
     {
         desired_speed = std::min(
             desired_speed,
             static_cast<float>(this->get_parameter("narrow_gap_max_speed").as_double()));
     }
+    const float configured_maximum_speed = static_cast<float>(
+        this->get_parameter("max_speed").as_double());
+    const float command_speed_ceiling = std::min(
+        configured_maximum_speed, reference_path_max_speed);
+    desired_speed = std::min(desired_speed, command_speed_ceiling);
+
+    // The path z value is a target, not permission to violate the measured
+    // speed-dependent turning radius. Apply the lateral-acceleration limit
+    // after every path/avoidance override so none of those branches can erase
+    // it again.
+    const float requested_speed_before_turn_cap = desired_speed;
+    const float turning_speed_cap = this->get_turning_speed_limit(
+        target_angle, std::max(vehicle_speed, desired_speed));
+    desired_speed = std::min(desired_speed, turning_speed_cap);
+    const float speed_comparison_epsilon = 0.02F;
+    const bool turning_speed_limited
+        = desired_speed + speed_comparison_epsilon
+            < requested_speed_before_turn_cap;
+
+    // Recheck the exact final steering transition at the speed we are about to
+    // request. Steering candidates were selected using the measured speed; a
+    // path-speed override can be much faster and therefore have a larger turn
+    // radius and a longer actuator-response distance. When the requested speed
+    // is unsafe, search for the highest lower speed that makes the same steering
+    // trajectory collision-free. This preserves speed when steering alone is
+    // sufficient and reduces only as much as the selected trajectory requires.
     desired_speed = std::min(desired_speed, risk_speed_cap);
+    const float minimum_crawl_speed = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("minimum_crawl_speed").as_double()));
+    const auto risk_for_candidate_speed = [&](float candidate_speed)
+    {
+        float speed_check_distance
+            = trajectory_check_distance_for_speed(candidate_speed);
+        const float candidate_braking_distance
+            = std::abs(candidate_speed) * brake_reaction_time
+            + candidate_speed * candidate_speed
+                / (2.0F * braking_deceleration)
+            + braking_margin;
+        speed_check_distance = std::min(
+            avoidance_preview_distance,
+            std::max(speed_check_distance, candidate_braking_distance));
+        return this->get_transition_trajectory_risk(
+            obstacle_points,
+            current_steering_angle,
+            target_angle,
+            candidate_speed,
+            speed_check_distance);
+    };
+    const float requested_trajectory_speed = desired_speed;
+    const TrajectoryRisk requested_speed_risk
+        = risk_for_candidate_speed(requested_trajectory_speed);
+    const bool requested_trajectory_has_risk
+        = std::isfinite(requested_speed_risk.collision_distance);
+    float trajectory_speed_cap = std::numeric_limits<float>::infinity();
+    if (requested_trajectory_has_risk)
+    {
+        // Show the requested-speed failure in debug when the currently measured
+        // speed is still safe. The emergency flag remains based only on the
+        // measured-speed trajectory, so this gate cannot create a false hard stop
+        // while merely preventing unsafe acceleration.
+        if (!current_trajectory_has_risk)
+        {
+            collision_distance = requested_speed_risk.collision_distance;
+            collision_ttc = requested_speed_risk.collision_time;
+        }
+
+        const float search_floor = std::min(
+            requested_trajectory_speed, minimum_crawl_speed);
+        float previous_unsafe_speed = requested_trajectory_speed;
+        float highest_safe_speed = -1.0F;
+        constexpr int speed_search_samples = 12;
+        for (int sample = 1; sample <= speed_search_samples; ++sample)
+        {
+            const float ratio
+                = static_cast<float>(sample)
+                / static_cast<float>(speed_search_samples);
+            const float candidate_speed = requested_trajectory_speed
+                + ratio * (search_floor - requested_trajectory_speed);
+            const TrajectoryRisk candidate_risk
+                = risk_for_candidate_speed(candidate_speed);
+            if (!std::isfinite(candidate_risk.collision_distance))
+            {
+                highest_safe_speed = candidate_speed;
+                break;
+            }
+            previous_unsafe_speed = candidate_speed;
+        }
+
+        if (highest_safe_speed >= 0.0F)
+        {
+            // Refine the highest safe boundary without adding another tuning
+            // parameter. Ten iterations resolve far below command precision.
+            float safe_speed = highest_safe_speed;
+            float unsafe_speed = previous_unsafe_speed;
+            for (int iteration = 0; iteration < 10; ++iteration)
+            {
+                const float candidate_speed
+                    = 0.5F * (safe_speed + unsafe_speed);
+                const TrajectoryRisk candidate_risk
+                    = risk_for_candidate_speed(candidate_speed);
+                if (std::isfinite(candidate_risk.collision_distance))
+                {
+                    unsafe_speed = candidate_speed;
+                }
+                else
+                {
+                    safe_speed = candidate_speed;
+                }
+            }
+            trajectory_speed_cap = safe_speed;
+        }
+        else
+        {
+            // The selected steering remains blocked even at crawl. Keep the
+            // vehicle steerable, but do not pretend that path speed is safe.
+            trajectory_speed_cap = search_floor;
+        }
+        desired_speed = std::min(desired_speed, trajectory_speed_cap);
+    }
+
+    bool braking_for_risk
+        = current_trajectory_has_risk
+        || turning_speed_limited
+        || requested_trajectory_has_risk;
+    // These are safety ceilings, not merely desired targets. The ordinary
+    // deceleration limiter may smooth a comfort slowdown, but it must never
+    // leave the published command above a speed that the selected turn or
+    // transition trajectory can physically support.
+    const float safety_speed_ceiling = std::min(
+        command_speed_ceiling,
+        std::min(
+            risk_speed_cap,
+            std::min(turning_speed_cap, trajectory_speed_cap)));
+    desired_speed = std::min(desired_speed, safety_speed_ceiling);
+    const float minimum_command_speed = std::min(
+        safety_speed_ceiling,
+        braking_for_risk
+            ? minimum_crawl_speed
+            : static_cast<float>(
+                this->get_parameter("minimum_non_emergency_speed").as_double()));
+    // A collision-free path command must not inherit the old distance-based
+    // acceleration taper. Otherwise a narrow but safe corridor remains at the
+    // minimum speed for its entire length even though desired_speed is high.
+    const float acceleration_distance = use_path_speed
+        ? static_cast<float>(
+            this->get_parameter("speed_increase_end").as_double())
+        : safe_distance;
+    const uint64_t command_time_ns
+        = static_cast<uint64_t>(command_time.nanoseconds());
+    float command_elapsed_time = static_cast<float>(
+        this->get_parameter("initial_update_time").as_double());
+    if (last_update_time != 0 && command_time_ns > last_update_time)
+    {
+        command_elapsed_time
+            = static_cast<float>(command_time_ns - last_update_time) * 1.0e-9F;
+    }
+    command_elapsed_time = std::max(1.0e-3F, command_elapsed_time);
+    const float previous_command_speed = current_vehicle_speed;
     float acceleration = 0.0;
-    new_msg.drive.speed = limit_speed_change(
+    float commanded_vehicle_speed = limit_speed_change(
         desired_speed,
-        safe_distance,
+        acceleration_distance,
         target_angle,
         emergency,
-        static_cast<uint64_t>(command_time.nanoseconds()),
+        minimum_command_speed,
+        safety_speed_ceiling,
+        command_time_ns,
         acceleration);
-    new_msg.drive.acceleration = acceleration;
+
+    // The acceleration limiter can publish a speed between the measured and
+    // requested endpoints.  Curvature is speed-dependent and not monotonic, so
+    // checking only those endpoints is insufficient. Validate the exact value
+    // that will be put on the wire and lower it only if that value is unsafe.
+    const TrajectoryRisk published_speed_risk
+        = risk_for_candidate_speed(commanded_vehicle_speed);
+    if (std::isfinite(published_speed_risk.collision_distance))
+    {
+        collision_distance = published_speed_risk.collision_distance;
+        collision_ttc = published_speed_risk.collision_time;
+        const float search_floor = std::min(
+            commanded_vehicle_speed, minimum_crawl_speed);
+        float previous_unsafe_speed = commanded_vehicle_speed;
+        float highest_safe_speed = -1.0F;
+        constexpr int publish_speed_search_samples = 16;
+        for (int sample = 1; sample <= publish_speed_search_samples; ++sample)
+        {
+            const float ratio = static_cast<float>(sample)
+                / static_cast<float>(publish_speed_search_samples);
+            const float candidate_speed = commanded_vehicle_speed
+                + ratio * (search_floor - commanded_vehicle_speed);
+            const TrajectoryRisk candidate_risk
+                = risk_for_candidate_speed(candidate_speed);
+            if (!std::isfinite(candidate_risk.collision_distance))
+            {
+                highest_safe_speed = candidate_speed;
+                break;
+            }
+            previous_unsafe_speed = candidate_speed;
+        }
+        if (highest_safe_speed >= 0.0F)
+        {
+            float safe_speed = highest_safe_speed;
+            float unsafe_speed = previous_unsafe_speed;
+            for (int iteration = 0; iteration < 10; ++iteration)
+            {
+                const float candidate_speed
+                    = 0.5F * (safe_speed + unsafe_speed);
+                const TrajectoryRisk candidate_risk
+                    = risk_for_candidate_speed(candidate_speed);
+                if (std::isfinite(candidate_risk.collision_distance))
+                {
+                    unsafe_speed = candidate_speed;
+                }
+                else
+                {
+                    safe_speed = candidate_speed;
+                }
+            }
+            commanded_vehicle_speed = safe_speed;
+        }
+        else
+        {
+            commanded_vehicle_speed = search_floor;
+        }
+        trajectory_speed_cap = std::min(
+            trajectory_speed_cap, commanded_vehicle_speed);
+        current_vehicle_speed = commanded_vehicle_speed;
+        acceleration = (commanded_vehicle_speed - previous_command_speed)
+            / command_elapsed_time;
+        braking_for_risk = true;
+    }
+    new_msg.drive.speed = this->vehicle_speed_to_wheel_speed(
+        commanded_vehicle_speed);
+    new_msg.drive.acceleration = this->vehicle_speed_to_wheel_speed(acceleration);
 
     drive_publisher->publish(new_msg);
     last_published_steering = target_angle;
@@ -2169,8 +2656,12 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         target_publisher->publish(target_waypoint_msg);
         this->publish_debug_markers(
             scan_msg->header, target_angle, target_distance, collision_distance,
-            path_guidance, current_steering_angle, actual_speed, collision_ttc,
-            braking_distance, emergency, braking_for_risk);
+            path_guidance, current_steering_angle, vehicle_speed,
+            commanded_vehicle_speed, collision_ttc, braking_distance,
+            turning_speed_cap, trajectory_speed_cap,
+            emergency, braking_for_risk,
+            preview_tracked, using_steering_avoidance,
+            target_angle > 0.0F ? 1 : (target_angle < 0.0F ? -1 : 0));
     }
 
     if (using_steering_avoidance)
@@ -2183,7 +2674,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
 };
 
 float ReactiveGapFollow::set_speed_from_distance(
-    float distance, float steering_angle, float actual_speed)
+    float distance, float steering_angle, float vehicle_speed)
 {
     float speed = distance * this->get_parameter("speed_factor").as_double();
     speed *= 1.0
@@ -2193,15 +2684,9 @@ float ReactiveGapFollow::set_speed_from_distance(
     // Use the measured speed-dependent curvature for both footprint prediction
     // and the lateral-acceleration speed cap. Evaluate at the larger of current
     // and requested speed so acceleration cannot assume a tighter low-speed arc.
-    const float curvature_speed = std::max(actual_speed, speed);
-    const float modeled_curvature = std::abs(
-        this->get_modeled_curvature(steering_angle, curvature_speed));
-    const float turning_speed = modeled_curvature > 1.0e-5F
-        ? std::sqrt(
-            9.81F
-            * static_cast<float>(this->get_parameter("friction").as_double())
-            / modeled_curvature)
-        : std::numeric_limits<float>::infinity();
+    const float curvature_speed = std::max(vehicle_speed, speed);
+    const float turning_speed = this->get_turning_speed_limit(
+        steering_angle, curvature_speed);
     float desired_speed = std::min(
         std::min(speed, turning_speed),
         static_cast<float>(this->get_parameter("max_speed").as_double()));
@@ -2227,6 +2712,8 @@ float ReactiveGapFollow::limit_speed_change(
     float distance,
     float steering_angle,
     bool emergency,
+    float minimum_command_speed,
+    float maximum_command_speed,
     uint64_t current_time,
     float& acceleration)
 {
@@ -2237,7 +2724,13 @@ float ReactiveGapFollow::limit_speed_change(
     }
     last_update_time = current_time;
 
-    const float previous_speed = current_speed;
+    const float previous_speed = current_vehicle_speed;
+    const float checked_maximum_speed = std::max(0.0F, maximum_command_speed);
+    const float checked_minimum_speed = std::max(
+        0.0F, std::min(minimum_command_speed, checked_maximum_speed));
+    desired_speed = std::max(
+        checked_minimum_speed,
+        std::min(desired_speed, checked_maximum_speed));
     const float minimum_crawl_speed = static_cast<float>(
         this->get_parameter("minimum_crawl_speed").as_double());
     const float max_deceleration = static_cast<float>(
@@ -2252,7 +2745,7 @@ float ReactiveGapFollow::limit_speed_change(
     // to a wall would leave the car unable to steer itself back out.
     if (emergency)
     {
-        current_speed = std::max(
+        current_vehicle_speed = std::max(
             minimum_crawl_speed, previous_speed - max_deceleration * elapsed_time);
     }
     else if (desired_speed > previous_speed)
@@ -2270,17 +2763,25 @@ float ReactiveGapFollow::limit_speed_change(
         const float acceleration_limit = min_acceleration
             + (this->get_parameter("max_acceleration").as_double() - min_acceleration)
             * get_speed_increase_ratio(distance) * steering_ratio;
-        current_speed = std::min(
+        current_vehicle_speed = std::min(
             desired_speed, previous_speed + acceleration_limit * elapsed_time);
     }
     else
     {
-        current_speed = std::max(
+        current_vehicle_speed = std::max(
             desired_speed, previous_speed - normal_deceleration * elapsed_time);
     }
 
-    acceleration = (current_speed - previous_speed) / elapsed_time;
-    return current_speed;
+    // The non-emergency minimum is a floor, not a fixed target: normal path
+    // and gap logic can command any higher value. BRAKE/STOP passes the crawl
+    // floor instead. Clamp the upper side as well so acceleration history can
+    // never carry a command above the maximum encoded by the locked path.
+    current_vehicle_speed = std::max(
+        checked_minimum_speed,
+        std::min(current_vehicle_speed, checked_maximum_speed));
+
+    acceleration = (current_vehicle_speed - previous_speed) / elapsed_time;
+    return current_vehicle_speed;
 }
 
 float ReactiveGapFollow::smooth_steering(float new_value)
