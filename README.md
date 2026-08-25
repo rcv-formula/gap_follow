@@ -127,9 +127,11 @@ modeled_curvature = ideal_curvature × curvature_gain(v)
 
 선택한 궤적에서 검사 horizon 안의 충돌점이 하나라도 발견되면 즉시 전체 조향 범위를 다시 검사합니다. `candidate_safety_level`로 계산한 `guard_clearance`가 공통 `candidate_min_clearance` 이상이고, 직사각형 전환 궤적이 horizon 끝까지 완전히 충돌 없는 조향만 회피 후보가 됩니다. 통과한 안전 후보들의 LiDAR clearance·조향 변화 점수에 path alignment 가산점을 더하므로 양쪽 회피가 모두 안전하면 path에 가까운 쪽을 우선합니다. 모든 조향에 충돌점이 있을 때만 속도 상한을 계산합니다.
 
-장애물을 피해 한쪽 조향을 선택하면 `avoidance_direction_hold_time` 동안 같은 방향을 유지합니다. 이후 정면 안전거리가 `2 × candidate_min_clearance` 이상인 상태가 `0.5 × avoidance_direction_hold_time` 동안 이어지면 고정을 해제합니다. 단, 고정된 쪽에서 안전한 궤적을 찾지 못하면 즉시 반대쪽 회피 또는 crawl을 허용합니다.
+장애물을 피해 한쪽 조향을 선택하면 회피를 유발한 LiDAR 충돌점을 `/odom` 좌표에 고정하고 같은 방향을 유지합니다. 정면 궤적뿐 아니라 global path 궤적이 막히고 안전한 detour가 선택된 경우에도 즉시 latch하므로, 장애물이 가까워지기 전에 일반 gap 선택이 좌우로 번갈아 바뀌는 현상을 막습니다. 옆으로 비켜서 현재 정면에서 장애물이 사라져도 latch를 풀지 않으며, 저장한 장애물이 차량 뒤쪽으로 차체 반 길이와 장애물 깊이 여유만큼 완전히 지나간 뒤에만 안전한 path 복귀를 허용합니다.
 
-최소 유지시간이 지난 뒤 global path 방향의 직사각형 전환 궤적이 안전하면 추가 정면-clear 대기 없이 회피 방향 고정을 해제하고 path 방향으로 복귀합니다. path 방향이 안전하지 않으면 기존 회피 방향을 계속 유지하므로 복귀 preference가 장애물 안전검사를 우회하지 않습니다.
+고정된 쪽이 위험해지면 반대쪽 궤적이 완전히 충돌 없고 `steering_transition_time` 동안 연속으로 안전할 때만 방향을 바꿉니다. 기존 방향의 TTC가 이 시간 이하인 비상상황에서는 안전한 반대편으로 즉시 전환합니다. 같은 장애물을 지나는 동안 이러한 보정 전환은 한 번만 허용하며, 이후 양쪽 모두 위험해지면 기존 조향 부호를 유지한 채 BRAKE/STOP으로 감속합니다. 마지막 독립 안전검사도 동일한 latch 규칙을 사용하므로 방향 고정을 우회하지 않습니다.
+
+최소 유지시간이 지나도 저장한 장애물을 아직 완전히 통과하지 않았으면 path 방향으로 조기 복귀하지 않습니다. 장애물을 통과했고 global path 방향의 직사각형 전환 궤적도 안전할 때만 복귀합니다.
 
 ### 6. 속도 제어
 
@@ -283,8 +285,8 @@ RViz에는 다음 display를 추가합니다.
 | `scan_filter_window` | `5` | 중앙값 필터 창 크기 |
 | `max_scan_angle` | `90.0` deg | 전방 기준 한쪽 시야각. 실제 사용 범위는 ±90도 |
 | `avoidance_steering_step` | `2.0` deg | 대체 조향 탐색 간격 |
-| `avoidance_steering_change_penalty` | `0.5` | 기존 gap 목표에서 크게 벗어나는 조향 억제값 |
-| `avoidance_direction_hold_time` | `0.6` s | 선택한 회피 방향을 최소 유지하는 시간 |
+| `avoidance_steering_change_penalty` | `0.3` | 기존 gap 목표에서 크게 벗어나는 조향 억제값 |
+| `avoidance_direction_hold_time` | `0.4` s | 선택한 회피 방향을 최소 유지하는 시간. 전방 장애물이 남아 있으면 이후에도 유지 |
 | `avoidance_direction_min_angle` | `10.0` deg | 회피 방향 고정을 시작하고 유지할 최소 조향각 |
 | `trajectory_check_distance` | `1.0` m | 현재 조향 궤적을 검사할 거리 |
 | `trajectory_check_step` | `0.05` m | 궤적 샘플 간격 |

@@ -81,8 +81,8 @@ trajectory_safety_margin: 0.05
 ### 현재 조향과 반대 방향으로 갑자기 꺾을 때
 
 ```yaml
-avoidance_steering_change_penalty: 0.5  # 0.7까지 증가 검토
-avoidance_direction_hold_time: 0.6      # 0.8까지 증가 검토
+avoidance_steering_change_penalty: 0.3  # 0.5까지 증가 검토
+avoidance_direction_hold_time: 0.4      # 0.6까지 증가 검토
 ```
 
 - `avoidance_steering_change_penalty`를 올리면 현재 조향과 기존 목표에서 크게 벗어나는 후보가 덜 선택됩니다.
@@ -93,10 +93,15 @@ avoidance_direction_hold_time: 0.6      # 0.8까지 증가 검토
 현재 방향 고정 해제 조건은 공통 파라미터에서 자동 계산됩니다.
 
 ```text
-최소 방향 유지시간: avoidance_direction_hold_time = 0.6 s
+최소 방향 유지시간: avoidance_direction_hold_time = 0.4 s
 정면 해제 안전거리: 2 × candidate_min_clearance = 1.0 m
-정면 clear 유지시간: 0.5 × avoidance_direction_hold_time = 0.3 s
+정면 clear 유지시간: 0.5 × avoidance_direction_hold_time = 0.2 s
+반대 방향 안전 확인시간: steering_transition_time = 0.2 s
 ```
+
+회피를 시작시킨 장애물 포인트는 `/odom` 좌표로 고정됩니다. 정면 궤적뿐 아니라 global path 궤적이 막힌 경우에도 안전한 detour 방향을 조기에 고정합니다. 차량이 옆으로 비켜 장애물이 현재 정면 궤적에서 사라져도, 저장한 포인트가 차량 후방으로 충분히 지나가기 전에는 처음 선택한 회피 방향을 계속 유지합니다.
+
+고정 방향이 위험해지면 반대쪽의 완전한 충돌 없는 상태가 `steering_transition_time` 동안 유지되어야 전환합니다. 현재 방향의 TTC가 이 시간 이하이면 안전한 반대쪽으로 즉시 전환하지만, 같은 장애물에 대한 좌우 보정은 한 번만 허용합니다. 이후 양쪽 모두 위험하면 기존 방향을 유지한 채 BRAKE/STOP으로 감속합니다.
 
 ### 갑자기 나타난 장애물에 반응이 늦을 때
 
@@ -253,9 +258,9 @@ preferred scan에서 기본 scan으로 더 일찍 전환하도록 `gap_fallback_
 다음 순서로 조정합니다.
 
 ```yaml
-avoidance_steering_change_penalty: 0.5  # 0.7까지 증가
+avoidance_steering_change_penalty: 0.3  # 0.5까지 증가
 steering_smooth_window: 3               # 4까지 증가
-avoidance_direction_hold_time: 0.6      # 0.8까지 증가
+avoidance_direction_hold_time: 0.4      # 0.6까지 증가
 ```
 
 - `avoidance_steering_change_penalty`: 안전 후보 중 현재 조향과 가까운 방향 선택

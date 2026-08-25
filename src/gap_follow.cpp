@@ -597,6 +597,8 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
             {
                 risk.collision_distance = travelled;
                 risk.collision_time = travelled / prediction_speed;
+                risk.collision_obstacle_x = obstacle.first;
+                risk.collision_obstacle_y = obstacle.second;
                 return risk;
             }
         }
@@ -1588,6 +1590,11 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     };
 
     const int64_t decision_time_ns = decision_time.nanoseconds();
+    const auto reset_pending_direction_switch = [&]()
+    {
+        pending_avoidance_direction = 0;
+        pending_avoidance_direction_start_time = 0;
+    };
     if (avoidance_direction != 0
         && decision_time_ns < avoidance_direction_start_time)
     {
@@ -1595,6 +1602,9 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         avoidance_direction = 0;
         avoidance_direction_start_time = 0;
         avoidance_clear_start_time = 0;
+        avoidance_direction_switched = false;
+        reset_pending_direction_switch();
+        avoidance_obstacle_locked = false;
     }
 
     const float straight_guard_clearance = guard_clearance_for_angle(0.0F);
@@ -1610,8 +1620,84 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         static_cast<float>(
             this->get_parameter("avoidance_direction_hold_time").as_double()));
     const float direction_release_time = 0.5F * direction_hold_time;
+    // Reuse the measured steering transition time instead of adding another
+    // tuning parameter. A one-scan opening on the opposite side is not enough
+    // to reverse an established avoidance command.
+    const float direction_switch_confirmation_time = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("steering_transition_time").as_double()));
     const float direction_release_clearance
         = 2.0F * minimum_avoidance_clearance;
+
+    const auto lock_avoidance_obstacle = [&](const TrajectoryRisk& risk)
+    {
+        if (!odom_speed_is_fresh
+            || !std::isfinite(risk.collision_obstacle_x)
+            || !std::isfinite(risk.collision_obstacle_y))
+        {
+            return false;
+        }
+
+        const auto& pose = latest_localization.pose.pose;
+        const double sin_yaw = 2.0 * (
+            pose.orientation.w * pose.orientation.z
+            + pose.orientation.x * pose.orientation.y);
+        const double cos_yaw = 1.0 - 2.0 * (
+            pose.orientation.y * pose.orientation.y
+            + pose.orientation.z * pose.orientation.z);
+        const double yaw = std::atan2(sin_yaw, cos_yaw);
+        const double local_x = static_cast<double>(risk.collision_obstacle_x)
+            + this->get_parameter("lidar_offset_x").as_double();
+        const double local_y = static_cast<double>(risk.collision_obstacle_y)
+            + this->get_parameter("lidar_offset_y").as_double();
+        avoidance_obstacle_global_x = pose.position.x
+            + std::cos(yaw) * local_x - std::sin(yaw) * local_y;
+        avoidance_obstacle_global_y = pose.position.y
+            + std::sin(yaw) * local_x + std::cos(yaw) * local_y;
+        avoidance_obstacle_locked = true;
+        return true;
+    };
+
+    // Older latch state (for example after a hot parameter/code restart) may
+    // not yet have an obstacle anchor. Acquire it as soon as the straight
+    // transition identifies the point that is forcing avoidance.
+    if (avoidance_direction != 0 && !avoidance_obstacle_locked)
+    {
+        lock_avoidance_obstacle(straight_risk);
+    }
+
+    bool tracked_obstacle_has_been_passed = false;
+    if (avoidance_obstacle_locked && odom_speed_is_fresh)
+    {
+        const auto& pose = latest_localization.pose.pose;
+        const double sin_yaw = 2.0 * (
+            pose.orientation.w * pose.orientation.z
+            + pose.orientation.x * pose.orientation.y);
+        const double cos_yaw = 1.0 - 2.0 * (
+            pose.orientation.y * pose.orientation.y
+            + pose.orientation.z * pose.orientation.z);
+        const double difference_x
+            = avoidance_obstacle_global_x - pose.position.x;
+        const double difference_y
+            = avoidance_obstacle_global_y - pose.position.y;
+        const double obstacle_x_in_vehicle
+            = cos_yaw * difference_x + sin_yaw * difference_y;
+        // The stored point is normally on the obstacle's front face. Require
+        // it to clear the rear half of the car plus one vehicle width (about
+        // the known 30 cm obstacle depth) and the common trajectory margin.
+        const double pass_clearance
+            = 0.5 * this->get_parameter("vehicle_length").as_double()
+            + this->get_parameter("vehicle_width").as_double()
+            + this->get_parameter("trajectory_safety_margin").as_double();
+        tracked_obstacle_has_been_passed
+            = obstacle_x_in_vehicle <= -pass_clearance;
+    }
+    // If odometry was unavailable when the latch began, retain the legacy
+    // forward-clear fallback. Normal operation uses the fixed odom anchor.
+    const bool avoidance_obstacle_has_cleared = avoidance_obstacle_locked
+        ? tracked_obstacle_has_been_passed
+        : !std::isfinite(straight_collision_distance);
 
     if (avoidance_direction != 0)
     {
@@ -1619,7 +1705,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             decision_time_ns - avoidance_direction_start_time) * 1.0e-9;
         const bool straight_is_clear
             = straight_guard_clearance >= direction_release_clearance
-            && !std::isfinite(straight_collision_distance);
+            && !std::isfinite(straight_collision_distance)
+            && avoidance_obstacle_has_cleared;
         if (held_seconds >= direction_hold_time && straight_is_clear)
         {
             if (avoidance_clear_start_time == 0)
@@ -1637,6 +1724,9 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 avoidance_direction = 0;
                 avoidance_direction_start_time = 0;
                 avoidance_clear_start_time = 0;
+                avoidance_direction_switched = false;
+                reset_pending_direction_switch();
+                avoidance_obstacle_locked = false;
             }
         }
         else
@@ -1653,7 +1743,14 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         const bool path_leaves_held_side
             = static_cast<float>(avoidance_direction) * path_rejoin_angle
                 < minimum_direction_angle;
-        if (held_seconds >= direction_hold_time && path_leaves_held_side)
+        // Keep the initially selected side until the obstacle that triggered
+        // avoidance has physically passed behind the vehicle. Merely shifting
+        // sideways can make the current straight trajectory look clear while
+        // the same obstacle is still alongside, which otherwise causes an
+        // avoid-rejoin-avoid zigzag.
+        if (held_seconds >= direction_hold_time
+            && path_leaves_held_side
+            && avoidance_obstacle_has_cleared)
         {
             const float path_guard_clearance
                 = guard_clearance_for_angle(path_rejoin_angle);
@@ -1684,10 +1781,76 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 avoidance_direction = 0;
                 avoidance_direction_start_time = 0;
                 avoidance_clear_start_time = 0;
+                avoidance_direction_switched = false;
+                reset_pending_direction_switch();
+                avoidance_obstacle_locked = false;
                 apply_avoidance_candidate(path_rejoin_candidate);
             }
         }
     }
+
+    const auto make_held_braking_candidate = [&]()
+    {
+        const float held_angle = clamp_steering(
+            static_cast<float>(avoidance_direction) * std::max(
+                minimum_direction_angle,
+                std::abs(last_published_steering)));
+        const TrajectoryRisk held_braking_risk
+            = this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                held_angle,
+                actual_speed,
+                trajectory_check_distance);
+        AvoidanceCandidate held_braking_candidate;
+        held_braking_candidate.valid = true;
+        held_braking_candidate.angle = held_angle;
+        held_braking_candidate.collision_distance
+            = held_braking_risk.collision_distance;
+        held_braking_candidate.collision_time
+            = held_braking_risk.collision_time;
+        return held_braking_candidate;
+    };
+
+    const auto try_confirmed_opposite_switch = [&] (
+        const AvoidanceCandidate& opposite_candidate,
+        const AvoidanceCandidate& held_braking_candidate)
+    {
+        if (avoidance_direction == 0
+            || avoidance_direction_switched
+            || !opposite_candidate.valid)
+        {
+            reset_pending_direction_switch();
+            return false;
+        }
+
+        const int opposite_direction = -avoidance_direction;
+        if (pending_avoidance_direction != opposite_direction)
+        {
+            pending_avoidance_direction = opposite_direction;
+            pending_avoidance_direction_start_time = decision_time_ns;
+        }
+        const double confirmed_seconds = static_cast<double>(
+            decision_time_ns - pending_avoidance_direction_start_time) * 1.0e-9;
+        const bool imminent_collision
+            = std::isfinite(held_braking_candidate.collision_time)
+            && held_braking_candidate.collision_time
+                <= direction_switch_confirmation_time;
+        const bool continuously_safe
+            = confirmed_seconds >= direction_switch_confirmation_time;
+        if (!imminent_collision && !continuously_safe)
+        {
+            return false;
+        }
+
+        avoidance_direction = opposite_direction;
+        avoidance_direction_start_time = decision_time_ns;
+        avoidance_clear_start_time = 0;
+        avoidance_direction_switched = true;
+        reset_pending_direction_switch();
+        apply_avoidance_candidate(opposite_candidate);
+        return true;
+    };
 
     if (avoidance_direction != 0)
     {
@@ -1705,24 +1868,38 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 = find_avoidance_candidate(avoidance_direction);
             if (held_side_candidate.valid)
             {
+                reset_pending_direction_switch();
                 apply_avoidance_candidate(held_side_candidate);
             }
             else
             {
-                // Never preserve a direction when that side itself became
-                // unsafe. Drop the latch and let the unrestricted search below
-                // choose another safe side or fall back to crawl.
-                avoidance_direction = 0;
-                avoidance_direction_start_time = 0;
-                avoidance_clear_start_time = 0;
+                // Change sides only when the opposite side has a completely
+                // collision-free transition. If neither side is safe, retain
+                // the committed steering sign while BRAKE/STOP reduces speed;
+                // repeatedly dropping the latch here makes the deepest finite
+                // candidate alternate left/right on every scan.
+                const AvoidanceCandidate opposite_side_candidate
+                    = find_avoidance_candidate(-avoidance_direction);
+                const AvoidanceCandidate held_braking_candidate
+                    = make_held_braking_candidate();
+                if (!try_confirmed_opposite_switch(
+                        opposite_side_candidate, held_braking_candidate))
+                {
+                    apply_avoidance_candidate(held_braking_candidate);
+                }
             }
+        }
+        else
+        {
+            reset_pending_direction_switch();
         }
     }
 
     // Final independent safety gate. Recompute the exact transition for the
     // command produced after smoothing, latch and path-rejoin logic. Any finite
-    // collision in the prediction horizon forces an unrestricted search for a
-    // completely collision-free steering trajectory.
+    // collision in the prediction horizon searches the latched side first and
+    // uses the same confirmed one-switch rule as the main latch branch. This
+    // gate must not silently undo the direction commitment.
     target_risk = this->get_transition_trajectory_risk(
         obstacle_points,
         current_steering_angle,
@@ -1733,10 +1910,42 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     collision_ttc = target_risk.collision_time;
     if (std::isfinite(collision_distance))
     {
-        const AvoidanceCandidate candidate = find_avoidance_candidate(0);
-        if (candidate.valid)
+        bool final_candidate_applied = false;
+        if (avoidance_direction != 0)
         {
-            apply_avoidance_candidate(candidate);
+            const AvoidanceCandidate held_side_candidate
+                = find_avoidance_candidate(avoidance_direction);
+            if (held_side_candidate.valid)
+            {
+                reset_pending_direction_switch();
+                apply_avoidance_candidate(held_side_candidate);
+                final_candidate_applied = true;
+            }
+            else
+            {
+                const AvoidanceCandidate opposite_side_candidate
+                    = find_avoidance_candidate(-avoidance_direction);
+                const AvoidanceCandidate held_braking_candidate
+                    = make_held_braking_candidate();
+                if (!try_confirmed_opposite_switch(
+                        opposite_side_candidate, held_braking_candidate))
+                {
+                    apply_avoidance_candidate(held_braking_candidate);
+                }
+                final_candidate_applied = true;
+            }
+        }
+        else
+        {
+            const AvoidanceCandidate candidate = find_avoidance_candidate(0);
+            if (candidate.valid)
+            {
+                apply_avoidance_candidate(candidate);
+                final_candidate_applied = true;
+            }
+        }
+        if (final_candidate_applied)
+        {
             // apply_avoidance_candidate() resets smoothing, but verify its final
             // output rather than relying on the candidate's pre-apply values.
             target_risk = this->get_transition_trajectory_risk(
@@ -1756,13 +1965,51 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         && !std::isfinite(collision_distance);
     const bool obstacle_on_straight_trajectory
         = std::isfinite(straight_collision_distance);
+
+    // A straight-only trigger starts too late once the vehicle has already
+    // yawed away from a centerline obstacle. Detect the same condition on the
+    // locked global-path direction, so the first safe detour is committed
+    // before ordinary gap scoring can alternate around the blocked path.
+    TrajectoryRisk latch_trigger_risk = straight_risk;
+    bool obstacle_on_reference_path = false;
+    if (avoidance_direction == 0 && path_guidance.active)
+    {
+        const float reference_path_angle
+            = clamp_steering(path_guidance.target_angle);
+        const TrajectoryRisk reference_path_risk
+            = this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                reference_path_angle,
+                actual_speed,
+                trajectory_check_distance);
+        const float reference_path_guard_clearance
+            = guard_clearance_for_angle(reference_path_angle);
+        const bool reference_path_is_blocked
+            = reference_path_guard_clearance < minimum_avoidance_clearance
+            || std::isfinite(reference_path_risk.collision_distance);
+        const float detour_from_reference_path = static_cast<float>(std::abs(
+            normalize_angle(target_angle - reference_path_angle)));
+        obstacle_on_reference_path
+            = reference_path_is_blocked
+            && detour_from_reference_path >= minimum_direction_angle;
+        if (obstacle_on_reference_path)
+        {
+            latch_trigger_risk = reference_path_risk;
+        }
+    }
+
     if (avoidance_direction == 0
-        && obstacle_on_straight_trajectory && final_trajectory_is_safe
+        && (obstacle_on_straight_trajectory || obstacle_on_reference_path)
+        && final_trajectory_is_safe
         && std::abs(target_angle) >= minimum_direction_angle)
     {
         avoidance_direction = target_angle > 0.0F ? 1 : -1;
         avoidance_direction_start_time = decision_time_ns;
         avoidance_clear_start_time = 0;
+        avoidance_direction_switched = false;
+        reset_pending_direction_switch();
+        lock_avoidance_obstacle(latch_trigger_risk);
         RCLCPP_DEBUG(
             this->get_logger(),
             "Latched avoidance direction %s at %.1f deg",

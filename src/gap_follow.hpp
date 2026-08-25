@@ -43,6 +43,8 @@ class ReactiveGapFollow : public rclcpp::Node
     {
         float collision_distance = std::numeric_limits<float>::infinity();
         float collision_time = std::numeric_limits<float>::infinity();
+        float collision_obstacle_x = std::numeric_limits<float>::quiet_NaN();
+        float collision_obstacle_y = std::numeric_limits<float>::quiet_NaN();
     };
 
     void global_path_callback(const nav_msgs::msg::Path::SharedPtr msg);
@@ -102,6 +104,14 @@ class ReactiveGapFollow : public rclcpp::Node
     int avoidance_direction = 0;
     int64_t avoidance_direction_start_time = 0;
     int64_t avoidance_clear_start_time = 0;
+    // An obstacle episode may correct its initially chosen side once, but it
+    // must not bounce back and forth as individual scan candidates flicker.
+    bool avoidance_direction_switched = false;
+    int pending_avoidance_direction = 0;
+    int64_t pending_avoidance_direction_start_time = 0;
+    bool avoidance_obstacle_locked = false;
+    double avoidance_obstacle_global_x = 0.0;
+    double avoidance_obstacle_global_y = 0.0;
 
     std::vector<PathPoint> reference_path;
     std::string reference_path_frame;
