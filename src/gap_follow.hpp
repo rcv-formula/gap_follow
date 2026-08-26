@@ -51,6 +51,9 @@ class ReactiveGapFollow : public rclcpp::Node
         float collision_time = std::numeric_limits<float>::infinity();
         float collision_obstacle_x = std::numeric_limits<float>::quiet_NaN();
         float collision_obstacle_y = std::numeric_limits<float>::quiet_NaN();
+        // Smallest Euclidean gap from the inflated rectangular footprint to an
+        // observed point anywhere along this rollout. Zero means contact.
+        float minimum_clearance = std::numeric_limits<float>::infinity();
     };
 
     void global_path_callback(const nav_msgs::msg::Path::SharedPtr msg);
@@ -73,7 +76,8 @@ class ReactiveGapFollow : public rclcpp::Node
     TrajectoryRisk get_transition_trajectory_risk(
         const std::vector<std::pair<float, float>>& obstacle_points,
         float current_steering_angle, float target_steering_angle,
-        float vehicle_speed, float check_distance) const;
+        float vehicle_speed, float check_distance,
+        bool track_minimum_clearance = false) const;
     float get_modeled_curvature(float steering_angle, float vehicle_speed) const;
     float get_turning_speed_limit(
         float steering_angle, float speed_reference) const;

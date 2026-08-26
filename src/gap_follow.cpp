@@ -1,6 +1,7 @@
 #include "gap_follow.hpp"
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -712,7 +713,8 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
     float current_steering_angle,
     float target_steering_angle,
     float vehicle_speed,
-    float check_distance) const
+    float check_distance,
+    bool track_minimum_clearance) const
 {
     const float check_step = std::max(
         0.01F,
@@ -747,6 +749,7 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
         static_cast<float>(
             this->get_parameter("steering_transition_time").as_double()));
     TrajectoryRisk risk;
+    float minimum_clearance_squared = std::numeric_limits<float>::infinity();
     float travelled = 0.0F;
     float vehicle_x = -lidar_offset_x;
     float vehicle_y = -lidar_offset_y;
@@ -764,9 +767,26 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
             // rectangle centre; the scan origin is shifted by lidar_offset_*.
             const float local_x = cos_yaw * difference_x + sin_yaw * difference_y;
             const float local_y = -sin_yaw * difference_x + cos_yaw * difference_y;
+            // Clearance ranking is only needed for the compact cluster that
+            // triggered avoidance. Computing hypot for every full-scan rollout
+            // cut the callback rate by more than half in test_38.
+            if (track_minimum_clearance)
+            {
+                const float clearance_x = std::max(
+                    0.0F, std::abs(local_x) - half_vehicle_length);
+                const float clearance_y = std::max(
+                    0.0F, std::abs(local_y) - half_vehicle_width);
+                minimum_clearance_squared = std::min(
+                    minimum_clearance_squared,
+                    clearance_x * clearance_x + clearance_y * clearance_y);
+            }
             if (std::abs(local_x) <= half_vehicle_length
                 && std::abs(local_y) <= half_vehicle_width)
             {
+                if (track_minimum_clearance)
+                {
+                    risk.minimum_clearance = 0.0F;
+                }
                 risk.collision_distance = travelled;
                 risk.collision_time = travelled / prediction_speed;
                 risk.collision_obstacle_x = obstacle.first;
@@ -795,6 +815,11 @@ ReactiveGapFollow::TrajectoryRisk ReactiveGapFollow::get_transition_trajectory_r
         vehicle_y += std::sin(midpoint_yaw) * distance_step;
         yaw += curvature * distance_step;
         travelled += distance_step;
+    }
+
+    if (track_minimum_clearance)
+    {
+        risk.minimum_clearance = std::sqrt(minimum_clearance_squared);
     }
 
     return risk;
@@ -2026,18 +2051,30 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         candidate_requested_speed, candidate_speed_ceiling);
     const float candidate_trajectory_speed = std::max(
         vehicle_speed, candidate_requested_speed);
-    // Candidate eligibility stays local even though the steering trigger sees
-    // the longer preview horizon. Extending every constant-command rollout to the
-    // full LiDAR distance rejects valid detours when their hypothetical later
-    // continuation reaches a side wall. The extra preview gate below requires
-    // the candidate to clear the triggering blocker, while allowing a later
-    // side-wall encounter to be handled by the next scan.
-    const float local_avoidance_candidate_check_distance = std::min(
-        obstacle_detection_distance,
-        std::max(
-            trajectory_check_distance_for_speed(candidate_trajectory_speed),
+    // Ordinary path/gap selection keeps its established horizon. Only the
+    // explicit alternative-to-braking search supplies a required distance and
+    // uses the shorter speed-dependent local horizon; its triggering blocker is
+    // still checked separately until the complete rectangle has passed it.
+    const auto local_avoidance_candidate_check_distance = [&] (
+        float checked_speed, float required_distance)
+    {
+        const float ordinary_candidate_distance = std::max(
+            trajectory_check_distance_for_speed(checked_speed),
             configured_trajectory_check_distance
-                + 1.5F * vehicle_length + braking_margin));
+                + 1.5F * vehicle_length + braking_margin);
+        if (required_distance <= 0.0F)
+        {
+            // Preserve the established path/gap behavior everywhere except the
+            // explicit alternative-to-braking search below.
+            return std::min(
+                obstacle_detection_distance, ordinary_candidate_distance);
+        }
+        return std::min(
+            obstacle_detection_distance,
+            std::max(
+                trajectory_check_distance_for_speed(checked_speed),
+                required_distance));
+    };
     const float minimum_preview_improvement = std::max(
         static_cast<float>(
             this->get_parameter("trajectory_check_step").as_double()),
@@ -2110,9 +2147,10 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         {
             return avoidance_preview_distance;
         }
-        // Continue the blocker-only rollout beyond first contact until the
-        // rectangular vehicle has had enough travel to put that surface behind
-        // its rear. Other preview walls are not part of this extended check.
+        // Ordinary candidate selection preserves the original complete-preview
+        // blocker check. The speed/steering fallback below may shorten this to
+        // the physical pass distance, but normal path/gap behavior must not be
+        // changed merely because a distant obstacle entered the preview.
         return std::max(
             avoidance_preview_distance,
             risk.collision_distance + 2.0F * vehicle_length
@@ -2212,19 +2250,55 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         float collision_time = std::numeric_limits<float>::infinity();
         TrajectoryRisk current_speed_preview_risk;
         TrajectoryRisk requested_speed_preview_risk;
+        bool blocker_clearance_available = false;
+        float blocker_clearance = std::numeric_limits<float>::infinity();
         float score = -std::numeric_limits<float>::infinity();
     };
 
     const auto find_avoidance_candidate = [&] (
         bool require_preview_improvement,
         const TrajectoryRisk& current_speed_baseline_preview_risk,
-        const TrajectoryRisk& requested_speed_baseline_preview_risk)
+        const TrajectoryRisk& requested_speed_baseline_preview_risk,
+        float requested_candidate_speed,
+        float required_all_obstacle_distance)
     {
         AvoidanceCandidate best;
+        const bool joint_pair_search = required_all_obstacle_distance > 0.0F;
+        const float candidate_check_distance
+            = local_avoidance_candidate_check_distance(
+                std::max(vehicle_speed, requested_candidate_speed),
+                required_all_obstacle_distance);
+        const auto candidate_blocker_horizon = [&] (const TrajectoryRisk& risk)
+        {
+            if (!joint_pair_search || !std::isfinite(risk.collision_distance))
+            {
+                return blocker_clearance_horizon(risk);
+            }
+            // Only the alternative to scalar braking uses a local maneuver:
+            // clear the complete vehicle past this blocker, then replan instead
+            // of assuming the same steering remains fixed for the full preview.
+            return std::min(
+                avoidance_preview_distance,
+                std::max(
+                    configured_trajectory_check_distance,
+                    risk.collision_distance + 2.0F * vehicle_length
+                        + 2.0F * braking_margin));
+        };
         const auto current_speed_blocker_points
             = blocker_points_for_risk(current_speed_baseline_preview_risk);
         const auto requested_speed_blocker_points
             = blocker_points_for_risk(requested_speed_baseline_preview_risk);
+        if (joint_pair_search
+            && current_speed_blocker_points.empty()
+            && requested_speed_blocker_points.empty())
+        {
+            // A finite preview collision is not enough to relax the long-wall
+            // rule.  The joint fallback is allowed only when the actual compact
+            // scan cluster that triggered it was recovered and can be checked
+            // until the complete vehicle has passed.  Otherwise retain the
+            // established BRAKE path.
+            return best;
+        }
         const float scan_last_angle = first_scan_angle
             + static_cast<float>(ranges.size() - 1) * angle_increment;
         const float search_min_angle = std::max(
@@ -2250,13 +2324,236 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 this->get_parameter("path_alignment_sigma").as_double()
                 * M_PI / 180.0));
 
+        // The ordinary avoidance search intentionally keeps every 1-degree
+        // candidate.  The joint steering/speed fallback can be called at five
+        // speed levels, however, and running every rectangular rollout for all
+        // ~78 angles caused 250--320 ms scan-callback gaps in test_38.  For that
+        // fallback only, use cheap LiDAR-ray scores to retain a bounded and
+        // diverse set from both physical sides of the blocker.  Every retained
+        // angle still has to pass all of the exact rectangular trajectory,
+        // turn-speed, preview, and blocker-clearance gates below.  Missing a
+        // candidate therefore falls back to braking; it can never make an
+        // unchecked angle eligible.
+        std::vector<float> candidate_angles;
+        if (!joint_pair_search)
+        {
+            for (float candidate_angle = search_min_angle;
+                candidate_angle <= search_max_angle + 0.5F * search_step;
+                candidate_angle += search_step)
+            {
+                candidate_angles.push_back(
+                    std::min(candidate_angle, search_max_angle));
+            }
+        }
+        else
+        {
+            struct QuickAngleCandidate
+            {
+                float angle = 0.0F;
+                float estimated_score = -std::numeric_limits<float>::infinity();
+                float guard_clearance = 0.0F;
+                float blocker_separation = 0.0F;
+                int blocker_side = 0;
+                int pass_guard_side = 0;
+            };
+
+            const TrajectoryRisk& representative_blocker_risk
+                = std::isfinite(
+                    current_speed_baseline_preview_risk.collision_distance)
+                ? current_speed_baseline_preview_risk
+                : requested_speed_baseline_preview_risk;
+            float blocker_bearing = target_angle;
+            if (std::isfinite(representative_blocker_risk.collision_obstacle_x)
+                && std::isfinite(
+                    representative_blocker_risk.collision_obstacle_y))
+            {
+                blocker_bearing = std::atan2(
+                    representative_blocker_risk.collision_obstacle_y,
+                    representative_blocker_risk.collision_obstacle_x);
+            }
+
+            std::vector<QuickAngleCandidate> quick_candidates;
+            for (float candidate_angle = search_min_angle;
+                candidate_angle <= search_max_angle + 0.5F * search_step;
+                candidate_angle += search_step)
+            {
+                const float checked_angle
+                    = std::min(candidate_angle, search_max_angle);
+                const float guard_clearance
+                    = guard_clearance_for_angle(checked_angle);
+                if (guard_clearance < minimum_avoidance_clearance)
+                {
+                    continue;
+                }
+
+                const float candidate_clearance
+                    = clearance_for_angle(checked_angle);
+                float estimated_score
+                    = std::min(candidate_clearance, distance_cap)
+                    - steering_change_penalty * (
+                        std::abs(checked_angle - target_angle)
+                        + std::abs(
+                            checked_angle - current_steering_angle));
+                if (path_guidance.active)
+                {
+                    const float path_difference = static_cast<float>(
+                        normalize_angle(
+                            checked_angle - path_guidance.target_angle));
+                    const float normalized_difference
+                        = path_difference / path_alignment_sigma;
+                    estimated_score += path_guidance.score_weight * std::exp(
+                        -0.5F * normalized_difference * normalized_difference);
+                }
+                const float signed_blocker_separation = static_cast<float>(
+                    normalize_angle(checked_angle - blocker_bearing));
+                QuickAngleCandidate quick;
+                quick.angle = checked_angle;
+                quick.estimated_score = estimated_score;
+                quick.guard_clearance = guard_clearance;
+                quick.blocker_separation
+                    = std::abs(signed_blocker_separation);
+                quick.blocker_side
+                    = signed_blocker_separation >= 0.0F ? 1 : -1;
+                quick.pass_guard_side
+                    = blocker_guard_side_for_angle(checked_angle);
+                quick_candidates.push_back(quick);
+            }
+
+            constexpr size_t maximum_joint_angle_candidates = 24;
+            const auto append_unique_angle = [&] (float angle)
+            {
+                if (candidate_angles.size() >= maximum_joint_angle_candidates)
+                {
+                    return;
+                }
+                const bool already_selected = std::any_of(
+                    candidate_angles.begin(), candidate_angles.end(),
+                    [&](float selected_angle)
+                    {
+                        return std::abs(selected_angle - angle)
+                            <= 0.25F * search_step;
+                    });
+                if (!already_selected)
+                {
+                    candidate_angles.push_back(angle);
+                }
+            };
+            const auto append_ranked = [&] (
+                std::vector<QuickAngleCandidate> ranked,
+                size_t count,
+                const auto& better)
+            {
+                std::stable_sort(ranked.begin(), ranked.end(), better);
+                for (size_t index = 0;
+                    index < std::min(count, ranked.size()); ++index)
+                {
+                    append_unique_angle(ranked[index].angle);
+                }
+            };
+            const auto candidates_on_blocker_side = [&] (int side)
+            {
+                std::vector<QuickAngleCandidate> side_candidates;
+                std::copy_if(
+                    quick_candidates.begin(), quick_candidates.end(),
+                    std::back_inserter(side_candidates),
+                    [&](const QuickAngleCandidate& candidate)
+                    {
+                        return candidate.blocker_side == side;
+                    });
+                return side_candidates;
+            };
+
+            for (const int side : {-1, 1})
+            {
+                const auto side_candidates
+                    = candidates_on_blocker_side(side);
+                append_ranked(
+                    side_candidates, 4,
+                    [](const QuickAngleCandidate& left,
+                       const QuickAngleCandidate& right)
+                    {
+                        return left.estimated_score > right.estimated_score;
+                    });
+                append_ranked(
+                    side_candidates, 2,
+                    [](const QuickAngleCandidate& left,
+                       const QuickAngleCandidate& right)
+                    {
+                        return left.guard_clearance > right.guard_clearance;
+                    });
+                append_ranked(
+                    side_candidates, 1,
+                    [](const QuickAngleCandidate& left,
+                       const QuickAngleCandidate& right)
+                    {
+                        return left.blocker_separation
+                            > right.blocker_separation;
+                    });
+                // Ray-clearance maxima can cluster at the steering limits even
+                // though the best transition trajectory is a moderate detour
+                // (about -25 degrees at test_38/228 s). Keep two angularly
+                // distributed representatives per physical side so that a
+                // usable middle arc is not lost before exact rollout checks.
+                if (!side_candidates.empty())
+                {
+                    append_unique_angle(
+                        side_candidates[(side_candidates.size() - 1) / 3].angle);
+                    append_unique_angle(
+                        side_candidates[
+                            2 * (side_candidates.size() - 1) / 3].angle);
+                }
+            }
+
+            const auto append_nearest_to = [&] (float reference_angle)
+            {
+                append_ranked(
+                    quick_candidates, 1,
+                    [&](const QuickAngleCandidate& left,
+                        const QuickAngleCandidate& right)
+                    {
+                        return std::abs(static_cast<float>(normalize_angle(
+                                   left.angle - reference_angle)))
+                            < std::abs(static_cast<float>(normalize_angle(
+                                   right.angle - reference_angle)));
+                    });
+            };
+            append_nearest_to(target_angle);
+            append_nearest_to(current_steering_angle);
+            if (path_guidance.active)
+            {
+                append_nearest_to(path_guidance.target_angle);
+            }
+
+            if (blocker_pass_guard_active)
+            {
+                std::vector<QuickAngleCandidate> guarded_candidates;
+                std::copy_if(
+                    quick_candidates.begin(), quick_candidates.end(),
+                    std::back_inserter(guarded_candidates),
+                    [&](const QuickAngleCandidate& candidate)
+                    {
+                        return candidate.pass_guard_side
+                            == blocker_pass_guard_side;
+                    });
+                append_ranked(
+                    guarded_candidates, 3,
+                    [](const QuickAngleCandidate& left,
+                       const QuickAngleCandidate& right)
+                    {
+                        return left.estimated_score > right.estimated_score;
+                    });
+            }
+
+            // Restore the original low-to-high ordering so equal final scores
+            // resolve exactly as before within the retained joint candidates.
+            std::sort(candidate_angles.begin(), candidate_angles.end());
+        }
+
         std::vector<AvoidanceCandidate> safe_candidates;
         float lidar_best_score = -std::numeric_limits<float>::infinity();
-        for (float candidate_angle = search_min_angle;
-            candidate_angle <= search_max_angle + 0.5F * search_step;
-            candidate_angle += search_step)
+        float best_blocker_clearance = -std::numeric_limits<float>::infinity();
+        for (const float checked_angle : candidate_angles)
         {
-            const float checked_angle = std::min(candidate_angle, search_max_angle);
             // Eligibility uses the lower candidate quantile so a narrow static
             // obstacle cannot be hidden by the broad p80 scoring clearance.
             const float guard_clearance
@@ -2270,8 +2567,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     obstacle_points,
                     current_steering_angle,
                     checked_angle,
-                    candidate_trajectory_speed,
-                    local_avoidance_candidate_check_distance);
+                    requested_candidate_speed,
+                    candidate_check_distance);
             // The candidate must clear the complete maneuver horizon above.
             // A later side-wall intersection of the hypothetical constant-turn
             // continuation is not part of this maneuver and is replanned from
@@ -2281,7 +2578,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 continue;
             }
             const bool distinct_candidate_speed
-                = std::abs(candidate_trajectory_speed - vehicle_speed) > 0.05F;
+                = std::abs(requested_candidate_speed - vehicle_speed) > 0.05F;
             const TrajectoryRisk current_speed_candidate_risk
                 = distinct_candidate_speed
                 ? this->get_transition_trajectory_risk(
@@ -2289,15 +2586,30 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     current_steering_angle,
                     checked_angle,
                     vehicle_speed,
-                    local_avoidance_candidate_check_distance)
+                    candidate_check_distance)
                 : candidate_risk;
             if (std::isfinite(current_speed_candidate_risk.collision_distance))
+            {
+                continue;
+            }
+            // During the joint steering/speed fallback, reject an angle whose
+            // measured turn model cannot sustain this speed before ranking it.
+            // Otherwise one sharp high-clearance winner can be returned and
+            // discarded by the caller while a slightly gentler feasible angle
+            // at the same speed is never considered.
+            if (required_all_obstacle_distance > 0.0F
+                && this->get_turning_speed_limit(
+                    checked_angle,
+                    std::max(vehicle_speed, requested_candidate_speed))
+                    + 0.02F < requested_candidate_speed)
             {
                 continue;
             }
 
             TrajectoryRisk current_speed_candidate_preview_risk;
             TrajectoryRisk requested_speed_candidate_preview_risk;
+            bool blocker_clearance_available = false;
+            float blocker_clearance = std::numeric_limits<float>::infinity();
             if (require_preview_improvement)
             {
                 requested_speed_candidate_preview_risk
@@ -2305,7 +2617,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     steering_preview_obstacle_points,
                     current_steering_angle,
                     checked_angle,
-                    candidate_trajectory_speed,
+                    requested_candidate_speed,
                     avoidance_preview_distance);
                 current_speed_candidate_preview_risk = distinct_candidate_speed
                     ? this->get_transition_trajectory_risk(
@@ -2315,16 +2627,54 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                         vehicle_speed,
                         avoidance_preview_distance)
                     : requested_speed_candidate_preview_risk;
-                if (!trajectory_clears_blocker(
-                        current_speed_blocker_points,
-                        current_speed_baseline_preview_risk,
-                        checked_angle,
-                        vehicle_speed)
-                    || !trajectory_clears_blocker(
-                        requested_speed_blocker_points,
-                        requested_speed_baseline_preview_risk,
-                        checked_angle,
-                        candidate_trajectory_speed))
+                if (!current_speed_blocker_points.empty())
+                {
+                    const TrajectoryRisk blocker_risk
+                        = this->get_transition_trajectory_risk(
+                            current_speed_blocker_points,
+                            current_steering_angle,
+                            checked_angle,
+                            vehicle_speed,
+                            candidate_blocker_horizon(
+                                current_speed_baseline_preview_risk),
+                            joint_pair_search);
+                    if (std::isfinite(blocker_risk.collision_distance))
+                    {
+                        continue;
+                    }
+                    blocker_clearance_available = true;
+                    if (joint_pair_search)
+                    {
+                        blocker_clearance = std::min(
+                            blocker_clearance, blocker_risk.minimum_clearance);
+                    }
+                }
+                if (!requested_speed_blocker_points.empty())
+                {
+                    const TrajectoryRisk blocker_risk
+                        = this->get_transition_trajectory_risk(
+                            requested_speed_blocker_points,
+                            current_steering_angle,
+                            checked_angle,
+                            requested_candidate_speed,
+                            candidate_blocker_horizon(
+                                requested_speed_baseline_preview_risk),
+                            joint_pair_search);
+                    if (std::isfinite(blocker_risk.collision_distance))
+                    {
+                        continue;
+                    }
+                    blocker_clearance_available = true;
+                    if (joint_pair_search)
+                    {
+                        blocker_clearance = std::min(
+                            blocker_clearance, blocker_risk.minimum_clearance);
+                    }
+                }
+                blocker_clearance_available
+                    = blocker_clearance_available && joint_pair_search;
+                if (blocker_clearance_available
+                    && !std::isfinite(blocker_clearance))
                 {
                     continue;
                 }
@@ -2334,8 +2684,17 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 {
                     if (!std::isfinite(baseline_preview_risk.collision_distance))
                     {
+                        // A constant-turn candidate may meet an unrelated side
+                        // wall later in the 4.5 m preview even though its local
+                        // maneuver and complete blocker pass are safe. Accept
+                        // that later encounter only when it remains beyond the
+                        // local checked horizon; the next scan replans it.
                         return !std::isfinite(
-                            candidate_preview_risk.collision_distance);
+                                candidate_preview_risk.collision_distance)
+                            || (joint_pair_search
+                                && candidate_preview_risk.collision_distance
+                                    >= candidate_check_distance
+                                        + minimum_preview_improvement);
                     }
                     return !std::isfinite(candidate_preview_risk.collision_distance)
                         || candidate_preview_risk.collision_distance
@@ -2373,8 +2732,16 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 = current_speed_candidate_preview_risk;
             candidate.requested_speed_preview_risk
                 = requested_speed_candidate_preview_risk;
+            candidate.blocker_clearance_available
+                = blocker_clearance_available;
+            candidate.blocker_clearance = blocker_clearance;
             safe_candidates.push_back(candidate);
             lidar_best_score = std::max(lidar_best_score, candidate_score);
+            if (blocker_clearance_available)
+            {
+                best_blocker_clearance = std::max(
+                    best_blocker_clearance, blocker_clearance);
+            }
         }
 
         // Every entry already passed the guard and rectangular-trajectory gates.
@@ -2396,6 +2763,34 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                     return blocker_guard_side_for_angle(candidate.angle)
                         == blocker_pass_guard_side;
                 });
+        // Compare blocker clearance only among candidates that the active pass
+        // guard permits. A larger-clearance candidate on the opposite side must
+        // not make a still-safe guarded-side pass look absent and cause a
+        // premature direction reversal.
+        if (guarded_side_has_safe_candidate)
+        {
+            best_blocker_clearance = -std::numeric_limits<float>::infinity();
+            for (const auto& candidate : safe_candidates)
+            {
+                if (candidate.blocker_clearance_available
+                    && blocker_guard_side_for_angle(candidate.angle)
+                        == blocker_pass_guard_side)
+                {
+                    best_blocker_clearance = std::max(
+                        best_blocker_clearance, candidate.blocker_clearance);
+                }
+            }
+        }
+        const bool blocker_clearance_comparable = std::isfinite(
+            best_blocker_clearance);
+        const auto has_comparable_blocker_clearance = [&] (
+            const AvoidanceCandidate& candidate)
+        {
+            return !blocker_clearance_comparable
+                || (candidate.blocker_clearance_available
+                    && candidate.blocker_clearance + 1.0e-4F
+                        >= best_blocker_clearance * minimum_score_ratio);
+        };
         for (auto candidate : safe_candidates)
         {
             // The guard is only a preference among candidates that already
@@ -2404,6 +2799,14 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             if (guarded_side_has_safe_candidate
                 && blocker_guard_side_for_angle(candidate.angle)
                     != blocker_pass_guard_side)
+            {
+                continue;
+            }
+            // A path-aligned trajectory may not win by merely grazing the
+            // blocker. Clearance is an eligibility gate only; retain the
+            // established path/gap score inside that safe band so this fallback
+            // cannot pull ordinary steering toward an unnecessarily large arc.
+            if (!has_comparable_blocker_clearance(candidate))
             {
                 continue;
             }
@@ -2537,7 +2940,9 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
             = find_avoidance_candidate(
                 true,
                 current_speed_target_preview_risk,
-                requested_speed_target_preview_risk);
+                requested_speed_target_preview_risk,
+                candidate_trajectory_speed,
+                0.0F);
         if (early_candidate.valid)
         {
             apply_avoidance_candidate(early_candidate);
@@ -2592,7 +2997,9 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
                 = find_avoidance_candidate(
                     true,
                     current_speed_route_preview_risk,
-                    requested_speed_route_preview_risk);
+                    requested_speed_route_preview_risk,
+                    candidate_trajectory_speed,
+                    0.0F);
             if (early_candidate.valid)
             {
                 apply_avoidance_candidate(early_candidate);
@@ -2625,7 +3032,8 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     {
         const AvoidanceCandidate guarded_candidate
             = find_avoidance_candidate(
-                false, TrajectoryRisk{}, TrajectoryRisk{});
+                false, TrajectoryRisk{}, TrajectoryRisk{},
+                candidate_trajectory_speed, 0.0F);
         if (guarded_candidate.valid)
         {
             apply_avoidance_candidate(guarded_candidate);
@@ -2655,7 +3063,9 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         const AvoidanceCandidate candidate = find_avoidance_candidate(
             preview_tracked,
             current_speed_selected_preview_risk,
-            requested_speed_selected_preview_risk);
+            requested_speed_selected_preview_risk,
+            candidate_trajectory_speed,
+            0.0F);
         if (candidate.valid)
         {
             apply_avoidance_candidate(candidate);
@@ -2725,6 +3135,141 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         {
             collision_distance = speed_relevant_preview_risk.collision_distance;
             collision_ttc = speed_relevant_preview_risk.collision_time;
+        }
+    }
+
+    // Preserve ordinary path/gap behavior and invoke the local steering/speed
+    // search only when the existing result would otherwise reach the risk speed
+    // layer. Apply the normal turn-speed cap before this test: a curve that is
+    // safe at its modeled speed must not trigger an expensive avoidance search
+    // merely because the raw path z value is higher.
+    float avoidance_speed_cap = std::numeric_limits<float>::infinity();
+    const float pair_speed_epsilon = 0.02F;
+    const auto pair_speed_check_distance = [&](float checked_speed)
+    {
+        const float checked_braking_distance
+            = std::abs(checked_speed) * brake_reaction_time
+            + checked_speed * checked_speed
+                / (2.0F * braking_deceleration)
+            + braking_margin;
+        return std::min(
+            obstacle_detection_distance,
+            std::max(
+                trajectory_check_distance_for_speed(checked_speed),
+                checked_braking_distance));
+    };
+    const float preliminary_pair_turn_cap = this->get_turning_speed_limit(
+        target_angle, std::max(vehicle_speed, candidate_requested_speed));
+    const float preliminary_pair_speed = std::min(
+        candidate_requested_speed, preliminary_pair_turn_cap);
+    const bool measured_pair_risk = std::isfinite(collision_distance);
+    TrajectoryRisk preliminary_requested_pair_risk;
+    if (measured_pair_risk || preview_tracked)
+    {
+        preliminary_requested_pair_risk
+            = this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                target_angle,
+                preliminary_pair_speed,
+                pair_speed_check_distance(preliminary_pair_speed));
+    }
+    const bool requested_pair_risk = std::isfinite(
+        preliminary_requested_pair_risk.collision_distance);
+    const float pair_critical_ttc = std::max(
+        0.0F,
+        static_cast<float>(
+            this->get_parameter("steering_transition_time").as_double()));
+    const bool pair_risk_is_emergency
+        = measured_pair_risk && collision_ttc <= pair_critical_ttc;
+    if ((measured_pair_risk || requested_pair_risk)
+        && !pair_risk_is_emergency)
+    {
+        const TrajectoryRisk current_baseline_preview_risk
+            = this->get_transition_trajectory_risk(
+                steering_preview_obstacle_points,
+                current_steering_angle,
+                target_angle,
+                vehicle_speed,
+                avoidance_preview_distance);
+        const float pair_search_floor = std::min(
+            preliminary_pair_speed, candidate_minimum_speed);
+        const float pair_speed_span
+            = preliminary_pair_speed - pair_search_floor;
+        constexpr int pair_speed_samples = 4;
+        for (int sample = 0; sample <= pair_speed_samples; ++sample)
+        {
+            if (sample > 0 && pair_speed_span <= pair_speed_epsilon)
+            {
+                break;
+            }
+            const float ratio = static_cast<float>(sample)
+                / static_cast<float>(pair_speed_samples);
+            const float checked_speed
+                = preliminary_pair_speed - ratio * pair_speed_span;
+            const float required_distance = std::max(
+                pair_speed_check_distance(checked_speed),
+                pair_speed_check_distance(vehicle_speed));
+            const TrajectoryRisk requested_baseline_preview_risk
+                = this->get_transition_trajectory_risk(
+                    steering_preview_obstacle_points,
+                    current_steering_angle,
+                    target_angle,
+                    checked_speed,
+                    avoidance_preview_distance);
+            const bool compact_blocker_tracked = std::isfinite(
+                    current_baseline_preview_risk.collision_distance)
+                || std::isfinite(
+                    requested_baseline_preview_risk.collision_distance);
+            if (!compact_blocker_tracked)
+            {
+                // The risk came from an extended wall rather than a compact
+                // obstacle. Keep the established turn/brake handling.
+                break;
+            }
+            // If only the requested-speed trajectory was risky and this same
+            // steering is now safe, scalar speed search will refine it without
+            // introducing an unnecessary steering change.
+            if (!measured_pair_risk
+                && !std::isfinite(
+                    requested_baseline_preview_risk.collision_distance))
+            {
+                break;
+            }
+            const AvoidanceCandidate pair_candidate
+                = find_avoidance_candidate(
+                    true,
+                    current_baseline_preview_risk,
+                    requested_baseline_preview_risk,
+                    checked_speed,
+                    required_distance);
+            if (!pair_candidate.valid)
+            {
+                continue;
+            }
+
+            apply_avoidance_candidate(pair_candidate);
+            activate_blocker_pass_guard(
+                pair_candidate.angle,
+                representative_preview_risk(
+                    current_baseline_preview_risk,
+                    requested_baseline_preview_risk));
+            avoidance_speed_cap = checked_speed;
+            preview_requires_speed_reduction = false;
+            unavoidable_current_speed_preview_risk = TrajectoryRisk{};
+            current_speed_selected_preview_risk
+                = pair_candidate.current_speed_preview_risk;
+            requested_speed_selected_preview_risk
+                = pair_candidate.requested_speed_preview_risk;
+            target_risk = this->get_transition_trajectory_risk(
+                obstacle_points,
+                current_steering_angle,
+                target_angle,
+                vehicle_speed,
+                trajectory_check_distance);
+            collision_distance = target_risk.collision_distance;
+            collision_ttc = target_risk.collision_time;
+            break;
         }
     }
 
@@ -2868,6 +3413,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
     const float command_speed_ceiling = std::min(
         configured_maximum_speed, reference_path_max_speed);
     desired_speed = std::min(desired_speed, command_speed_ceiling);
+    desired_speed = std::min(desired_speed, avoidance_speed_cap);
 
     // The path z value is a target, not permission to violate the measured
     // speed-dependent turning radius. Apply the lateral-acceleration limit
@@ -2894,7 +3440,7 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         0.0F,
         static_cast<float>(
             this->get_parameter("minimum_crawl_speed").as_double()));
-    const auto risk_for_candidate_speed = [&](float candidate_speed)
+    const auto trajectory_speed_check_distance = [&](float candidate_speed)
     {
         float speed_check_distance
             = trajectory_check_distance_for_speed(candidate_speed);
@@ -2906,19 +3452,24 @@ void ReactiveGapFollow::lidar_callback(sensor_msgs::msg::LaserScan::SharedPtr sc
         speed_check_distance = std::min(
             obstacle_detection_distance,
             std::max(speed_check_distance, candidate_braking_distance));
+        return speed_check_distance;
+    };
+    const auto risk_for_candidate_speed = [&](float candidate_speed)
+    {
         return this->get_transition_trajectory_risk(
             obstacle_points,
             current_steering_angle,
             target_angle,
             candidate_speed,
-            speed_check_distance);
+            trajectory_speed_check_distance(candidate_speed));
     };
     const float requested_trajectory_speed = desired_speed;
     const TrajectoryRisk requested_speed_risk
         = risk_for_candidate_speed(requested_trajectory_speed);
     const bool requested_trajectory_has_risk
         = std::isfinite(requested_speed_risk.collision_distance);
-    float trajectory_speed_cap = std::numeric_limits<float>::infinity();
+    float trajectory_speed_cap = avoidance_speed_cap;
+
     if (requested_trajectory_has_risk)
     {
         // Show the requested-speed failure in debug when the currently measured
